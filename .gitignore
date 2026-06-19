@@ -2,3 +2,7 @@
 
 /venv/
 __pycache__/
+
+bot_sessions.db
+gps_bot.db
+bot_sessions.db
