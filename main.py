@@ -76,6 +76,74 @@ def is_ticket_required_intent(intent: str) -> bool:
     return intent in ["GPS_DAMAGED", "VEHICLE_RUNNING_GPS_NOT_UPDATING", "VEHICLE_STANDING", "OTHER"]
 
 
+def normalize_whatsapp_number(raw: str) -> str:
+    """
+    Normalise a phone number to E.164 format (digits only, with country code).
+    - Strips spaces, dashes, parentheses.
+    - If the number already starts with '91' and is 12 digits → keep as-is.
+    - If it's a 10-digit Indian number → prepend '91'.
+    - Otherwise → return stripped digits as-is.
+    """
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        return "91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits
+    return digits
+
+
+def forward_alert_to_driver(driver_number: str, original_session: dict) -> None:
+    """
+    Initialise a fresh session for the driver and send them the same
+    initial alert that was sent to the original customer, so the GPS
+    resolution flow continues with the driver directly.
+
+    If the driver already has an active session we skip re-initialisation
+    to avoid overwriting an in-progress conversation.
+    """
+    existing = database.get_session(driver_number)
+
+    # Don't overwrite an already-active driver session
+    if existing["current_state"] not in [None, "INITIAL_ALERT"]:
+        print(f"[DRIVER FWD] Driver {driver_number} already has active session "
+              f"({existing['current_state']}). Skipping.")
+        return
+
+    # Build the initial alert from the original session's first bot message
+    original_history = original_session.get("chat_history", [])
+    initial_alert_msg = next(
+        (m["text"] for m in original_history if m["role"] == "bot"),
+        None,
+    )
+
+    if not initial_alert_msg:
+        print(f"[DRIVER FWD] Could not find original alert message in session history. Skipping.")
+        return
+
+    database.save_session(
+        phone_number=driver_number,
+        state="INITIAL_ALERT",
+        collected_json={
+            "intent": None,
+            "vehicle_location": None,
+            "service_date": None,
+            "arrival_date": None,
+            "driver_phone": None,
+            "driver_name": None,
+            "contact_person": None,
+            "origin_city": None,
+            "destination_city": None,
+            "resume_date": None,
+            "ticket_id": None,
+            "forwarded_from": original_session.get("phone_number"),  # audit trail
+        },
+        chat_history=[{"role": "bot", "text": initial_alert_msg}],
+    )
+
+    send_whatsapp_meta(driver_number, initial_alert_msg)
+    print(f"[DRIVER FWD] Alert forwarded to driver {driver_number}")
+
+
 # ==========================================
 # 3. GROQ SYSTEM DEFINITION
 # ==========================================
@@ -202,7 +270,7 @@ Since all 3 required fields (vehicle_location, service_date, driver_phone) are p
 
 
 def build_execution_context(session: dict, user_input: str) -> str:
-    """Builds the full context string passed to Groq."""
+    """Builds the full context string passed to Azure OpenAI."""
     from datetime import date
     today_str = date.today().strftime("%d %B %Y")  # e.g. "19 June 2026"
     recent_history = session["chat_history"][-10:]  # last 10 messages for context window efficiency
@@ -263,7 +331,7 @@ def merge_extracted_data(existing: dict, new_data: dict) -> dict:
 
 def post_process_extracted(data: dict) -> dict:
     """
-    Deterministic post-processing applied AFTER Groq extraction.
+    Deterministic post-processing applied AFTER LLM extraction.
     Handles two concerns that must not be left to LLM probability:
       1. Date normalization  — raw tokens → ISO dates
       2. Route resolution    — destination_city always wins as vehicle_location
@@ -272,10 +340,8 @@ def post_process_extracted(data: dict) -> dict:
     today = date.today()
 
     # ── 1. Route resolution: destination beats origin for vehicle_location ─────
-    # Groq is instructed to do this, but we enforce it here as a hard guarantee.
     dest = data.get("destination_city")
     if dest:
-        # If destination is known, vehicle_location must equal destination
         data["vehicle_location"] = dest
         print(f"[ROUTE FIX] vehicle_location set to destination: {dest}")
 
@@ -292,26 +358,18 @@ def post_process_extracted(data: dict) -> dict:
 
 
 def infer_route_fields(extracted: dict, user_input: str) -> dict:
-    """Infer missing route fields from the latest user message.
-
-    If a route phrase is present and destination_city is missing, use the
-    extracted vehicle_location to populate destination_city. Also parse
-    simple "X se Y ja" route patterns when destination info is missing.
-    """
+    """Infer missing route fields from the latest user message."""
     if extracted is None:
         extracted = {}
 
     text = user_input.lower()
 
-    # If the message contains a route-like phrase and we already know the
-    # current vehicle location, treat that as the destination city.
     route_indicators = [r"\bse\b.*\bja(?:\s+rahi)?\b", r"\bse\b.*\bpahuch", r"\bse\b.*\bpahunch", r"\bse\b.*\bpahuche"]
     if not extracted.get("destination_city") and extracted.get("vehicle_location"):
         if any(re.search(pattern, text) for pattern in route_indicators):
             extracted["destination_city"] = extracted["vehicle_location"]
             print(f"[ROUTE INFER] destination_city inferred from vehicle_location: {extracted['vehicle_location']}")
 
-    # Try to parse explicit X se Y ja/pahuch patterns.
     if not extracted.get("destination_city"):
         match = re.search(
             r"\b([A-Za-z]+)\s+se\s+([A-Za-z]+)\s+(?:ja(?:\s+rahi)?|pahuch(?:e|i|a|egi)?|pahunch(?:e|i|a)?)\b",
@@ -343,11 +401,6 @@ def pre_process_user_input(user_input: str) -> str:
     Pre-process user input BEFORE sending to LLM.
     Resolves weekday phrases and relative date references to concrete ISO dates
     so the LLM cannot miscalculate them.
-    
-    Examples:
-      "Next Monday"        → "2026-06-22 (Next Monday)"
-      "Next Friday service chahiye" → "2026-06-26 (Next Friday) service chahiye"
-      "agle somwar"        → "2026-06-22 (agle somwar)"
     """
     import re
     from datetime import date, timedelta
@@ -369,7 +422,6 @@ def pre_process_user_input(user_input: str) -> str:
             days_ahead = 7
         return today + timedelta(days=days_ahead)
 
-    # Pattern: "next <weekday>" or "agle <hindi_weekday>"
     pattern = re.compile(
         r"\b(next|agle|agli)\s+(" + "|".join(_WEEKDAY_MAP.keys()) + r")\b",
         re.IGNORECASE
@@ -399,10 +451,10 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     if not user_input or user_input.strip() == "":
         return "Kripya apna message dobara bhejein.", current_state, collected
 
-    # ── Build context and call Azure OpenAI ──────────────────────────────────
-    # Pre-process: resolve weekday phrases before LLM sees them
+    # ── Pre-process: resolve weekday phrases before LLM sees them ─────────────
     user_input = pre_process_user_input(user_input)
 
+    # ── Build context and call Azure OpenAI ──────────────────────────────────
     execution_context = build_execution_context(session, user_input)
 
     raw_content = ""
@@ -504,6 +556,34 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     if llm_next_state == "COLLECTING_DETAILS" and is_ticket_required_intent(locked_intent or ""):
         llm_reply = build_collection_reply(updated_collected)
 
+    # ── Driver phone forwarding ───────────────────────────────────────────────
+    # If a driver/contact phone number was just extracted and we haven't already
+    # forwarded the alert to a driver in this session, do it now.
+    raw_driver_phone = updated_collected.get("driver_phone")
+    already_forwarded = collected.get("driver_forwarded")  # flag set on first forward
+
+    if (
+        raw_driver_phone
+        and raw_driver_phone not in ("NOT_PROVIDED",)
+        and not already_forwarded
+        and raw_driver_phone != session.get("phone_number")  # don't forward to self
+    ):
+        driver_number = normalize_whatsapp_number(raw_driver_phone)
+        # Extra guard: don't forward to the original sender even after normalisation
+        original_normalized = normalize_whatsapp_number(session.get("phone_number", ""))
+        if driver_number != original_normalized:
+            forward_alert_to_driver(driver_number, session)
+            updated_collected["driver_forwarded"] = True  # prevent double-forward
+
+            # Reply only with driver forwarding confirmation
+            forwarded_notice = (
+                f"✅ Humne driver ko ({driver_number}) message kar diya hai. Woh jald respond karenge."
+            )
+            llm_reply = forwarded_notice
+            print(f"[DRIVER FWD] Reply replaced with driver confirmation for {session.get('phone_number')}")
+        else:
+            print(f"[DRIVER FWD] Driver number same as sender after normalisation. Skipping forward.")
+
     final_state = llm_next_state
     return llm_reply, final_state, updated_collected
 
@@ -565,9 +645,7 @@ async def process_whatsapp_webhook(request: Request):
 
     # ── Guard: conversation already fully closed ──────────────────────────────
     if session["current_state"] in ["TICKET_RAISED", "CASE_CLOSED"]:
-        # Allow reopen / new issue by checking if user says something like "new issue" or just log it
         print(f"[SESSION] Conversation already closed (state={session['current_state']}). Ignoring further input.")
-        # For now, silently ignore closed conversations. Can be extended with reopen logic.
         return {"status": "conversation_closed"}
 
     # ── Append user message to history ───────────────────────────────────────
@@ -628,7 +706,8 @@ async def trigger_outage(payload: OutageRequest):
             "origin_city": None,
             "destination_city": None,
             "resume_date": None,
-            "ticket_id": None
+            "ticket_id": None,
+            "driver_forwarded": False,
         },
         chat_history=[{"role": "bot", "text": initial_alert_msg}]
     )
