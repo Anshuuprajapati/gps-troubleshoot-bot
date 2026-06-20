@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import re
 import requests
 from typing import Optional
 from fastapi import FastAPI, Request, Query, HTTPException
@@ -290,6 +291,53 @@ def post_process_extracted(data: dict) -> dict:
     return data
 
 
+def infer_route_fields(extracted: dict, user_input: str) -> dict:
+    """Infer missing route fields from the latest user message.
+
+    If a route phrase is present and destination_city is missing, use the
+    extracted vehicle_location to populate destination_city. Also parse
+    simple "X se Y ja" route patterns when destination info is missing.
+    """
+    if extracted is None:
+        extracted = {}
+
+    text = user_input.lower()
+
+    # If the message contains a route-like phrase and we already know the
+    # current vehicle location, treat that as the destination city.
+    route_indicators = [r"\bse\b.*\bja(?:\s+rahi)?\b", r"\bse\b.*\bpahuch", r"\bse\b.*\bpahunch", r"\bse\b.*\bpahuche"]
+    if not extracted.get("destination_city") and extracted.get("vehicle_location"):
+        if any(re.search(pattern, text) for pattern in route_indicators):
+            extracted["destination_city"] = extracted["vehicle_location"]
+            print(f"[ROUTE INFER] destination_city inferred from vehicle_location: {extracted['vehicle_location']}")
+
+    # Try to parse explicit X se Y ja/pahuch patterns.
+    if not extracted.get("destination_city"):
+        match = re.search(
+            r"\b([A-Za-z]+)\s+se\s+([A-Za-z]+)\s+(?:ja(?:\s+rahi)?|pahuch(?:e|i|a|egi)?|pahunch(?:e|i|a)?)\b",
+            text
+        )
+        if match:
+            origin, dest = match.group(1).capitalize(), match.group(2).capitalize()
+            extracted.setdefault("origin_city", origin)
+            extracted["destination_city"] = dest
+            print(f"[ROUTE INFER] origin_city={origin}, destination_city={dest}")
+            if not extracted.get("vehicle_location"):
+                extracted["vehicle_location"] = dest
+
+    return extracted
+
+
+def build_collection_reply(collected: dict) -> str:
+    if not collected.get("vehicle_location"):
+        return "Vehicle ka location kya hai? Kahan par hai aapki vehicle?"
+    if not collected.get("service_date"):
+        return "Service date kya hai? Kab service karwana hai?"
+    if not collected.get("driver_phone"):
+        return "Driver ka phone number kya hai? Contact number do."
+    return "Kripya thoda aur detail dein."
+
+
 def pre_process_user_input(user_input: str) -> str:
     """
     Pre-process user input BEFORE sending to LLM.
@@ -391,10 +439,12 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     llm_reply = parsed_output.get("reply_to_user", "Kripya dobara batayein.")
 
     # ── Deterministic post-processing (dates + route resolution) ─────────────
+    new_extracted = infer_route_fields(new_extracted, user_input)
     new_extracted = post_process_extracted(new_extracted)
 
     # ── Smart merge: never lose existing data ─────────────────────────────────
     updated_collected = merge_extracted_data(collected, new_extracted)
+    updated_collected = infer_route_fields(updated_collected, user_input)
 
     # ── Intent locking: if intent already set, do not override ────────────────
     if collected.get("intent") and new_extracted.get("intent") != collected.get("intent"):
@@ -449,6 +499,10 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
             llm_next_state = "TICKET_RAISED"
             print(f"\n[🎟️ AUTO TICKET] {ticket_id} — all fields filled, LLM missed TICKET_RAISED state.")
             database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
+
+    # If we are still collecting required ticket fields, use deterministic prompts.
+    if llm_next_state == "COLLECTING_DETAILS" and is_ticket_required_intent(locked_intent or ""):
+        llm_reply = build_collection_reply(updated_collected)
 
     final_state = llm_next_state
     return llm_reply, final_state, updated_collected
