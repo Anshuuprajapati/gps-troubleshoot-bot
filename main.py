@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-from groq import Groq
+from openai import AzureOpenAI
 from dotenv import load_dotenv
 
 import database
@@ -14,8 +14,14 @@ from date_utils import normalize_date
 
 load_dotenv()
 
-app = FastAPI(title="Meta WhatsApp + Groq AI Troubleshooting Hub")
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+app = FastAPI(title="Meta WhatsApp + Azure OpenAI Troubleshooting Hub")
+
+azure_client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+)
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 
 database.init_db()
 
@@ -69,38 +75,6 @@ def is_ticket_required_intent(intent: str) -> bool:
     return intent in ["GPS_DAMAGED", "VEHICLE_RUNNING_GPS_NOT_UPDATING", "VEHICLE_STANDING", "OTHER"]
 
 
-def ensure_reply_keywords(reply: str, collected_json: dict, current_state: str) -> str:
-    """
-    Safety net: Ensures critical keywords are present in bot replies for consistency with tests.
-    If asking for a specific field and keywords are missing, injects them.
-    """
-    reply_lower = reply.lower()
-    
-    # Determine which field we're asking for (if in COLLECTING_DETAILS)
-    if current_state == "COLLECTING_DETAILS":
-        loc = collected_json.get("vehicle_location")
-        date_ = collected_json.get("service_date")
-        phone = collected_json.get("driver_phone")
-        
-        # If location is missing, should ask for it with "kahan"
-        if not loc and "kahan" not in reply_lower and "location" not in reply_lower:
-            reply = "Aapki vehicle kahan hai? " + reply
-            print("[KEYWORD FIX] Added 'kahan' to location request")
-        
-        # If date is missing (but location is present), should ask with "kab"
-        if loc and not date_ and "kab" not in reply_lower and "date" not in reply_lower:
-            reply = "Service kab chahiye? " + reply
-            print("[KEYWORD FIX] Added 'kab' to date request")
-        
-        # If phone is missing (but location and date present), should ask with "contact" and "driver"
-        if loc and date_ and not phone:
-            if "contact" not in reply_lower or "driver" not in reply_lower:
-                reply = "Driver ka contact number kya hai? " + reply
-                print("[KEYWORD FIX] Added 'contact' and 'driver' to phone request")
-    
-    return reply
-
-
 # ==========================================
 # 3. GROQ SYSTEM DEFINITION
 # ==========================================
@@ -143,9 +117,10 @@ When user replies to initial alert (option number or description), map to intent
 Natural language like "gadi running me hai" or "GPS update nahi ho raha chal rahi hai" → VEHICLE_RUNNING_GPS_NOT_UPDATING.
 
 ## CASE CLOSED FLOW (intents: WORKSHOP, ACCIDENT, BATTERY_DISCONNECT, GPS_REMOVED)
-- If resume_date is NOT known: ask ONLY "Vehicle dobara kab running condition mein aa jayegi?"
+- If resume_date is NOT known: set next_state = "COLLECTING_DETAILS", ask ONLY "Vehicle dobara kab running condition mein aa jayegi?"
 - If resume_date IS known: set next_state = "CASE_CLOSED", reply = "✅ Update note kar liya gaya hai. Dhanyavaad."
 - Do NOT create a ticket. Do NOT ask anything else.
+- RESUME DATE EXTRACTION: "parso tak theek ho jayegi" → resume_date = "parso". "kal aa jayegi" → resume_date = "kal". "3 din mein" → resume_date = "3 din mein". ANY time reference given in response to "kab running hogi" question → THAT IS resume_date, NOT arrival_date or service_date.
 
 ## TICKET REQUIRED FLOW (intents: GPS_DAMAGED, VEHICLE_RUNNING_GPS_NOT_UPDATING, VEHICLE_STANDING, OTHER)
 - Required fields: vehicle_location, service_date, driver_phone
@@ -156,10 +131,15 @@ Natural language like "gadi running me hai" or "GPS update nahi ho raha chal rah
 - Priority order to ask: vehicle_location → service_date → driver_phone
 - When ALL 3 fields are filled: set next_state = "TICKET_RAISED"
 
-### SPECIFIC REPLY KEYWORDS (CRITICAL FOR TESTING):
-When asking for vehicle_location: MUST include word "kahan" (where). Example: "Aapki vehicle kahan hai?"
-When asking for service_date: MUST include word "kab" (when). Example: "Service kab chahiye?"
-When asking for driver_phone: MUST include words "contact", "number", and "driver". Example: "Driver ka contact number kya hai?"
+## LOCATION UPDATE RULE
+- If user CORRECTS a previously given location (e.g. "Nahi Mumbai nahi, Pune me hai", "Actually Nagpur me hai"), extract the NEW corrected city as vehicle_location. The latest location always wins.
+
+## PHONE REFUSAL HANDLING
+- If user refuses to give phone number ("nahi dena", "baad me", "no number"), set driver_phone = "NOT_PROVIDED" and set next_state = "TICKET_RAISED" with whatever data is available. Do NOT keep asking.
+
+## SHORTHAND / TYPO UNDERSTANDING
+- Understand abbreviations and typos: "gps dmg" = GPS damaged, "vhcl" = vehicle, "srvce" = service, "tmrw" = tomorrow, "cntct" = contact, "h" = hai, "m" = mein, "n" = nahi
+- Treat emoji-only replies as unclear → ask for the missing field again politely
 
 ## ROUTE & LOCATION EXTRACTION (CRITICAL)
 The vehicle service location is always where it CURRENTLY IS or where it IS GOING — the DESTINATION.
@@ -310,6 +290,56 @@ def post_process_extracted(data: dict) -> dict:
     return data
 
 
+def pre_process_user_input(user_input: str) -> str:
+    """
+    Pre-process user input BEFORE sending to LLM.
+    Resolves weekday phrases and relative date references to concrete ISO dates
+    so the LLM cannot miscalculate them.
+    
+    Examples:
+      "Next Monday"        → "2026-06-22 (Next Monday)"
+      "Next Friday service chahiye" → "2026-06-26 (Next Friday) service chahiye"
+      "agle somwar"        → "2026-06-22 (agle somwar)"
+    """
+    import re
+    from datetime import date, timedelta
+    today = date.today()
+
+    _WEEKDAY_MAP = {
+        "monday": 0, "mon": 0, "somwar": 0, "somvaar": 0,
+        "tuesday": 1, "tue": 1, "tues": 1, "mangalwar": 1,
+        "wednesday": 2, "wed": 2, "budhwar": 2,
+        "thursday": 3, "thu": 3, "thurs": 3, "guruwar": 3, "veervar": 3,
+        "friday": 4, "fri": 4, "shukrawar": 4, "shukravar": 4,
+        "saturday": 5, "sat": 5, "shaniwar": 5,
+        "sunday": 6, "sun": 6, "raviwar": 6, "itwaar": 6,
+    }
+
+    def next_weekday(wd: int) -> date:
+        days_ahead = (wd - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        return today + timedelta(days=days_ahead)
+
+    # Pattern: "next <weekday>" or "agle <hindi_weekday>"
+    pattern = re.compile(
+        r"\b(next|agle|agli)\s+(" + "|".join(_WEEKDAY_MAP.keys()) + r")\b",
+        re.IGNORECASE
+    )
+
+    def replace_weekday(m):
+        day_word = m.group(2).lower()
+        wd = _WEEKDAY_MAP.get(day_word)
+        if wd is not None:
+            resolved = next_weekday(wd).isoformat()
+            print(f"[PRE-PROCESS] '{m.group(0)}' → '{resolved}'")
+            return f"{resolved}"
+        return m.group(0)
+
+    processed = pattern.sub(replace_weekday, user_input)
+    return processed
+
+
 def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     """
     Core processing pipeline. Returns (reply_text, next_state, updated_collected_json).
@@ -321,12 +351,16 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     if not user_input or user_input.strip() == "":
         return "Kripya apna message dobara bhejein.", current_state, collected
 
-    # ── Build context and call Groq ───────────────────────────────────────────
+    # ── Build context and call Azure OpenAI ──────────────────────────────────
+    # Pre-process: resolve weekday phrases before LLM sees them
+    user_input = pre_process_user_input(user_input)
+
     execution_context = build_execution_context(session, user_input)
 
+    raw_content = ""
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        response = azure_client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
             messages=[
                 {"role": "system", "content": SYSTEM_INSTRUCTION},
                 {"role": "user", "content": execution_context}
@@ -337,26 +371,24 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
         raw_content = response.choices[0].message.content
         parsed_output = json.loads(raw_content)
     except json.JSONDecodeError as e:
-        print(f"[GROQ JSON PARSE ERROR] {e} | Raw: {raw_content}")
+        print(f"[AZURE JSON PARSE ERROR] {e} | Raw: {raw_content}")
         return "Ek technical issue aa gaya hai. Kripya dobara try karein.", current_state, collected
     except Exception as e:
         error_str = str(e)
-        # Check for rate limit error
-        if "429" in error_str or "rate_limit" in error_str.lower():
-            print(f"[GROQ RATE LIMIT] {e}")
+        if "429" in error_str or "rate_limit" in error_str.lower() or "RateLimitError" in type(e).__name__:
+            print(f"[AZURE RATE LIMIT] {e}")
             return "Kripya kuch der baad dobara try karein. (API rate limit exceeded)", current_state, collected
-        else:
-            print(f"[GROQ API ERROR] {e}")
-            return "Service temporarily unavailable. Please try again.", current_state, collected
+        print(f"[AZURE API ERROR] {e}")
+        return "Service temporarily unavailable. Please try again.", current_state, collected
 
     # ── Debug log ─────────────────────────────────────────────────────────────
-    print(f"\n[🤖 GROQ DEBUG] State: {current_state} → {parsed_output.get('next_state')}")
-    print(f"[🤖 GROQ DEBUG] Notes: {parsed_output.get('debug_notes', '')}")
-    print(f"[🤖 GROQ DEBUG] Extracted: {parsed_output.get('extracted_data', {})}")
+    print(f"\n[🤖 AZURE DEBUG] State: {current_state} → {parsed_output.get('next_state')}")
+    print(f"[🤖 AZURE DEBUG] Notes: {parsed_output.get('debug_notes', '')}")
+    print(f"[🤖 AZURE DEBUG] Extracted: {parsed_output.get('extracted_data', {})}")
 
     new_extracted = parsed_output.get("extracted_data", {})
-    groq_next_state = parsed_output.get("next_state", current_state)
-    groq_reply = parsed_output.get("reply_to_user", "Kripya dobara batayein.")
+    llm_next_state = parsed_output.get("next_state", current_state)
+    llm_reply = parsed_output.get("reply_to_user", "Kripya dobara batayein.")
 
     # ── Deterministic post-processing (dates + route resolution) ─────────────
     new_extracted = post_process_extracted(new_extracted)
@@ -372,19 +404,21 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     locked_intent = updated_collected.get("intent")
 
     # ── State machine override guard ──────────────────────────────────────────
-    if groq_next_state == "TICKET_RAISED":
+    if llm_next_state == "TICKET_RAISED":
         # Final validation: ensure all 3 required fields are truly present
         loc = updated_collected.get("vehicle_location")
         date_ = updated_collected.get("service_date")
         phone = updated_collected.get("driver_phone")
 
-        if not all([loc, date_, phone]):
+        # "NOT_PROVIDED" counts as filled (user refused, we proceed anyway)
+        phone_filled = phone and len(str(phone)) > 0
+        if not all([loc, date_, phone_filled]):
             print(f"[TICKET GUARD] Fields incomplete. loc={loc}, date={date_}, phone={phone}")
-            groq_next_state = "COLLECTING_DETAILS"
+            llm_next_state = "COLLECTING_DETAILS"
         else:
             # All fields present — generate ticket and override reply
             ticket_id = generate_ticket_id()
-            groq_reply = build_ticket_message(ticket_id, updated_collected)
+            llm_reply = build_ticket_message(ticket_id, updated_collected)
             updated_collected["ticket_id"] = ticket_id
             print(f"\n[🎟️ TICKET CREATED] {ticket_id} for {session.get('phone_number', 'UNKNOWN')}")
             print(f"[🎟️ TICKET DATA] {json.dumps(updated_collected)}")
@@ -392,30 +426,32 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
             # Persist ticket to its own table
             database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
 
-    elif groq_next_state == "CASE_CLOSED":
+    elif llm_next_state == "CASE_CLOSED":
         # Validate resume_date exists before closing
         if not updated_collected.get("resume_date") and is_case_closed_intent(locked_intent or ""):
-            groq_next_state = "COLLECTING_DETAILS"
+            llm_next_state = "COLLECTING_DETAILS"
+        # CRITICAL: if locked_intent is a TICKET flow, LLM is wrong to CASE_CLOSE —
+        # user said "workshop" mid-flow but intent is already GPS_DAMAGED etc.
+        elif is_ticket_required_intent(locked_intent or ""):
+            print(f"[CASE_CLOSE BLOCK] Intent {locked_intent} requires ticket. Overriding CASE_CLOSED → COLLECTING_DETAILS")
+            llm_next_state = "COLLECTING_DETAILS"
 
-    # ── Auto-promote to TICKET_RAISED if all fields now filled (Groq missed it) ─
-    elif groq_next_state == "COLLECTING_DETAILS" and is_ticket_required_intent(locked_intent or ""):
+    # ── Auto-promote to TICKET_RAISED if all fields now filled (LLM missed it) ─
+    elif llm_next_state == "COLLECTING_DETAILS" and is_ticket_required_intent(locked_intent or ""):
         loc = updated_collected.get("vehicle_location")
         date_ = updated_collected.get("service_date")
         phone = updated_collected.get("driver_phone")
-        if all([loc, date_, phone]):
+        phone_filled = phone and len(str(phone)) > 0
+        if all([loc, date_, phone_filled]):
             ticket_id = generate_ticket_id()
-            groq_reply = build_ticket_message(ticket_id, updated_collected)
+            llm_reply = build_ticket_message(ticket_id, updated_collected)
             updated_collected["ticket_id"] = ticket_id
-            groq_next_state = "TICKET_RAISED"
-            print(f"\n[🎟️ AUTO TICKET] {ticket_id} — all fields filled, Groq missed TICKET_RAISED state.")
+            llm_next_state = "TICKET_RAISED"
+            print(f"\n[🎟️ AUTO TICKET] {ticket_id} — all fields filled, LLM missed TICKET_RAISED state.")
             database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
 
-    # ── Ensure critical keywords are present in replies (safety net for consistent testing) ─
-    if groq_next_state == "COLLECTING_DETAILS":
-        groq_reply = ensure_reply_keywords(groq_reply, updated_collected, groq_next_state)
-
-    final_state = groq_next_state
-    return groq_reply, final_state, updated_collected
+    final_state = llm_next_state
+    return llm_reply, final_state, updated_collected
 
 
 # ==========================================

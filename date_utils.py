@@ -1,7 +1,7 @@
 """
 date_utils.py — Deterministic date normalization for GPS bot.
 
-Converts raw date strings extracted by Groq into ISO-formatted dates (YYYY-MM-DD).
+Converts raw date strings extracted by LLM into ISO-formatted dates (YYYY-MM-DD).
 
 Rules:
   - Bare day numbers ("25", "25 ko", "25th") → that day in current month.
@@ -9,6 +9,7 @@ Rules:
   - "kal"  → tomorrow
   - "parso" → day after tomorrow
   - "aaj"  → today
+  - "next monday/tuesday/..." → next occurrence of that weekday
   - Already well-formed dates (YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY, "25 June") → parse directly.
   - If nothing matches, return the raw string unchanged so we never silently drop data.
 """
@@ -28,19 +29,23 @@ _MONTH_MAP = {
     "dec": 12, "december": 12,
 }
 
+_WEEKDAY_MAP = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
 
 def _next_valid_day(day: int, today: date) -> date:
-    """
-    Return a date object for 'day' in the current month.
-    If that day has already passed (strictly before today), roll to next month.
-    Clamps to the last valid day of the month (e.g. day=31 in April → April 30).
-    """
     year, month = today.year, today.month
     max_day = monthrange(year, month)[1]
     clamped = min(day, max_day)
     candidate = date(year, month, clamped)
     if candidate < today:
-        # Roll to next month
         if month == 12:
             year, month = year + 1, 1
         else:
@@ -51,12 +56,15 @@ def _next_valid_day(day: int, today: date) -> date:
     return candidate
 
 
+def _next_weekday(weekday_num: int, today: date) -> date:
+    """Return next occurrence of weekday_num (0=Mon, 6=Sun), always in the future."""
+    days_ahead = weekday_num - today.weekday()
+    if days_ahead <= 0:
+        days_ahead += 7
+    return today + timedelta(days=days_ahead)
+
+
 def normalize_date(raw: str | None, today: date | None = None) -> str | None:
-    """
-    Normalize a raw date string to YYYY-MM-DD.
-    Returns None if raw is None/empty.
-    Returns raw unchanged if it cannot be parsed (so data is never lost).
-    """
     if not raw:
         return raw
 
@@ -66,10 +74,18 @@ def normalize_date(raw: str | None, today: date | None = None) -> str | None:
     # ── relative keywords ─────────────────────────────────────────────────────
     if s in ("aaj", "today"):
         return today.isoformat()
-    if s in ("kal", "tomorrow", "kal tak"):
+    if s in ("kal", "tomorrow", "kal tak", "tmrw", "tmr"):
         return (today + timedelta(days=1)).isoformat()
     if s in ("parso", "day after tomorrow"):
         return (today + timedelta(days=2)).isoformat()
+
+    # ── next <weekday> ────────────────────────────────────────────────────────
+    m = re.match(r"next\s+(\w+)", s)
+    if m:
+        day_word = m.group(1)
+        wd = _WEEKDAY_MAP.get(day_word)
+        if wd is not None:
+            return _next_weekday(wd, today).isoformat()
 
     # ── already ISO YYYY-MM-DD ────────────────────────────────────────────────
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
@@ -95,7 +111,6 @@ def normalize_date(raw: str | None, today: date | None = None) -> str | None:
             year = int(year_str) if year_str else today.year
             try:
                 candidate = date(year, month_num, day_num)
-                # If no year was specified and date has passed, roll to next year
                 if not year_str and candidate < today:
                     candidate = date(year + 1, month_num, day_num)
                 return candidate.isoformat()
@@ -109,6 +124,5 @@ def normalize_date(raw: str | None, today: date | None = None) -> str | None:
         if 1 <= day_num <= 31:
             return _next_valid_day(day_num, today).isoformat()
 
-    # ── nothing matched — return original so we don't silently lose it ─────────
     print(f"[DATE UTILS] Could not normalize '{raw}', returning as-is.")
     return raw
