@@ -52,18 +52,23 @@ def generate_ticket_id() -> str:
 
 def build_ticket_message(ticket_id: str, data: dict) -> str:
     """Builds the final ticket creation confirmation message."""
-    return (
+    ticket_msg = (
         f"✅ Service request create kar di gayi hai!\n\n"
         f"📋 Ticket Details:\n\n"
         f"🎫 Ticket ID: {ticket_id}\n"
         f"📍 Location: {data.get('vehicle_location', 'N/A')}\n"
         f"📅 Service Date: {data.get('service_date', 'N/A')}\n"
         f"📞 Contact: {data.get('driver_phone', 'N/A')}\n\n"
+    )
+    if data.get("driver_notified"):
+        ticket_msg += "👤 Driver ko bhi notify kar diya gaya hai.\n\n"
+    ticket_msg += (
         f"👤 Engineer assignment jald ho jayega.\n\n"
         f"Engineer aapse jald sampark karega.\n\n"
         f"Koi sawal ho toh Ticket ID {ticket_id} ke saath humse sampark karein.\n\n"
         f"Dhanyavaad!"
     )
+    return ticket_msg
 
 
 def is_case_closed_intent(intent: str) -> bool:
@@ -329,6 +334,154 @@ def merge_extracted_data(existing: dict, new_data: dict) -> dict:
     return merged
 
 
+def is_affirmative_response(text: str) -> bool:
+    cleaned = text.strip().lower()
+    return bool(re.search(r"\b(haan|han|yes|jee|ji|theek|thik|bilkul|sure|please do|kar do|kar du|ekdam)\b", cleaned))
+
+
+def is_negative_response(text: str) -> bool:
+    cleaned = text.strip().lower()
+    return bool(re.search(r"\b(nahi|na|abhi nahi|kal possible nahi|nahi possible|not now|no)\b", cleaned))
+
+
+def is_phone_refusal_response(text: str) -> bool:
+    cleaned = text.strip().lower()
+    return bool(re.search(
+        r"\b(nahi dena|na dena|baad me|baad mein|no number|no phone|phone nahi|number nahi|provide phone nahi)\b",
+        cleaned
+    ))
+
+
+def add_days(days: int) -> str:
+    from datetime import date, timedelta
+    return (date.today() + timedelta(days=days)).isoformat()
+
+
+def enrich_phone_contact(extracted: dict, user_input: str) -> dict:
+    if not extracted.get("driver_phone"):
+        match = re.search(r"\b(\d{10})\b", user_input)
+        if match:
+            extracted["driver_phone"] = match.group(1)
+    if extracted.get("driver_phone") and not extracted.get("contact_person"):
+        if re.search(r"\bdriver\b", user_input, re.IGNORECASE):
+            extracted["contact_person"] = "driver"
+    return extracted
+
+
+def all_ticket_fields_present(collected: dict) -> bool:
+    service_location = collected.get("vehicle_location")
+    service_date = collected.get("service_date")
+    driver_phone = collected.get("driver_phone")
+    return bool(service_location and service_date and driver_phone and len(str(driver_phone)) > 0)
+
+
+def advance_service_booking_stage(collected: dict, user_input: str) -> dict:
+    """Advance staged service booking flow for ticket-required intents."""
+    if not is_ticket_required_intent(collected.get("intent", "")):
+        return collected
+
+    if not collected.get("vehicle_location"):
+        return collected
+
+    stage = collected.get("service_booking_stage")
+    service_date_exists = bool(collected.get("service_date"))
+    phone_exists = bool(collected.get("driver_phone")) and len(str(collected.get("driver_phone"))) > 0
+    ticket_ready = all_ticket_fields_present(collected)
+
+    if ticket_ready:
+        collected["service_booking_stage"] = "COMPLETED"
+        return collected
+
+    if service_date_exists and stage is None:
+        collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
+        return collected
+
+    if stage is None:
+        collected["service_booking_stage"] = "ASK_TOMORROW"
+        return collected
+
+    if stage == "ASK_TOMORROW":
+        if service_date_exists or is_affirmative_response(user_input):
+            if not service_date_exists:
+                collected["service_date"] = add_days(1)
+            collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
+            return collected
+        if is_negative_response(user_input):
+            collected["service_booking_stage"] = "ASK_4_DAYS"
+            return collected
+
+    if stage == "ASK_4_DAYS":
+        if service_date_exists or is_affirmative_response(user_input):
+            if not service_date_exists:
+                collected["service_date"] = add_days(4)
+            collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
+            return collected
+        if is_negative_response(user_input):
+            collected["service_booking_stage"] = "ASK_7_DAYS"
+            return collected
+
+    if stage == "ASK_7_DAYS":
+        if service_date_exists or is_affirmative_response(user_input):
+            if not service_date_exists:
+                collected["service_date"] = add_days(7)
+            collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
+            return collected
+        if is_negative_response(user_input):
+            collected["service_booking_stage"] = "ASK_NEXT_TRIP"
+            return collected
+
+    if stage == "ASK_NEXT_TRIP":
+        if collected.get("destination_city"):
+            collected["service_booking_stage"] = "ASK_ARRIVAL"
+            return collected
+        if collected.get("arrival_date"):
+            if not collected.get("service_date"):
+                collected["service_date"] = collected["arrival_date"]
+            collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
+            return collected
+        if service_date_exists:
+            collected["service_booking_stage"] = "ASK_DESTINATION"
+            return collected
+
+    if stage == "ASK_DESTINATION":
+        if collected.get("destination_city"):
+            collected["service_booking_stage"] = "ASK_ARRIVAL"
+            return collected
+
+    if stage == "ASK_ARRIVAL":
+        if collected.get("arrival_date"):
+            if not collected.get("service_date"):
+                collected["service_date"] = collected["arrival_date"]
+            collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
+            return collected
+        if collected.get("service_date"):
+            collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
+            return collected
+
+    if stage == "ASK_SERVICE_CENTER_CONFIRMATION":
+        if is_affirmative_response(user_input):
+            collected["service_booking_stage"] = "COMPLETED" if phone_exists else "ASK_PHONE"
+            return collected
+        if is_negative_response(user_input):
+            collected["service_booking_stage"] = "ASK_SERVICE_LOCATION_FALLBACK"
+            return collected
+        if service_date_exists and phone_exists:
+            collected["service_booking_stage"] = "COMPLETED"
+            return collected
+
+    if stage == "ASK_SERVICE_LOCATION_FALLBACK":
+        if collected.get("vehicle_location") and service_date_exists:
+            collected["service_booking_stage"] = "ASK_PHONE" if not phone_exists else "COMPLETED"
+            return collected
+
+    if stage == "ASK_PHONE":
+        if phone_exists:
+            collected["service_booking_stage"] = "COMPLETED"
+            return collected
+
+    return collected
+
+
 def post_process_extracted(data: dict) -> dict:
     """
     Deterministic post-processing applied AFTER LLM extraction.
@@ -389,10 +542,27 @@ def infer_route_fields(extracted: dict, user_input: str) -> dict:
 def build_collection_reply(collected: dict) -> str:
     if not collected.get("vehicle_location"):
         return "Vehicle ka location kya hai? Kahan par hai aapki vehicle?"
-    if not collected.get("service_date"):
-        return "Service date kya hai? Kab service karwana hai?"
-    if not collected.get("driver_phone"):
-        return "Driver ka phone number kya hai? Contact number do."
+
+    stage = collected.get("service_booking_stage")
+    if stage == "ASK_TOMORROW":
+        return "Kya main service kal book kar du?"
+    if stage == "ASK_4_DAYS":
+        return "4 din baad service book kar du?"
+    if stage == "ASK_7_DAYS":
+        return "7 din baad service book kar du?"
+    if stage == "ASK_NEXT_TRIP":
+        return "Vehicle agli trip par kab jayegi?"
+    if stage == "ASK_DESTINATION":
+        return "Kya main jaan sakta hu vehicle kahan ja rahi hai?"
+    if stage == "ASK_ARRIVAL":
+        return "Vehicle wahan kab tak pahunch jayegi?"
+    if stage == "ASK_SERVICE_CENTER_CONFIRMATION":
+        return "Kya main nearest service center par visit book kar du?"
+    if stage == "ASK_SERVICE_LOCATION_FALLBACK":
+        return "Aapki preferred service location kya hai?"
+    if stage == "ASK_PHONE" or not collected.get("driver_phone"):
+        return "Driver ka contact number bata dijiye."
+
     return "Kripya thoda aur detail dein."
 
 
@@ -497,16 +667,39 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     # ── Smart merge: never lose existing data ─────────────────────────────────
     updated_collected = merge_extracted_data(collected, new_extracted)
     updated_collected = infer_route_fields(updated_collected, user_input)
+    updated_collected = enrich_phone_contact(updated_collected, user_input)
+
+    # Guard against a spurious 'NOT_PROVIDED' extraction when the user did not refuse.
+    if (
+        updated_collected.get("driver_phone") == "NOT_PROVIDED"
+        and not is_phone_refusal_response(user_input)
+    ):
+        print(f"[PHONE REFUSAL OVERRIDE] Ignoring NOT_PROVIDED from input: {user_input}")
+        updated_collected["driver_phone"] = None
 
     # ── Intent locking: if intent already set, do not override ────────────────
     if collected.get("intent") and new_extracted.get("intent") != collected.get("intent"):
         updated_collected["intent"] = collected["intent"]
         print(f"[INTENT LOCK] Keeping original intent: {collected['intent']}")
 
+    updated_collected = advance_service_booking_stage(updated_collected, user_input)
     locked_intent = updated_collected.get("intent")
 
+    ticket_ready = is_ticket_required_intent(locked_intent or "") and all_ticket_fields_present(updated_collected)
+    ticket_created = False
+    driver_notification = False
+    if ticket_ready:
+        ticket_id = generate_ticket_id()
+        updated_collected["ticket_id"] = ticket_id
+        llm_reply = build_ticket_message(ticket_id, updated_collected)
+        llm_next_state = "TICKET_RAISED"
+        ticket_created = True
+        print(f"\n[🎟️ TICKET CREATED] {ticket_id} for {session.get('phone_number', 'UNKNOWN')}")
+        print(f"[🎟️ TICKET DATA] {json.dumps(updated_collected)}")
+        database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
+
     # ── State machine override guard ──────────────────────────────────────────
-    if llm_next_state == "TICKET_RAISED":
+    if not ticket_created and llm_next_state == "TICKET_RAISED":
         # Final validation: ensure all 3 required fields are truly present
         loc = updated_collected.get("vehicle_location")
         date_ = updated_collected.get("service_date")
@@ -574,15 +767,14 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
         if driver_number != original_normalized:
             forward_alert_to_driver(driver_number, session)
             updated_collected["driver_forwarded"] = True  # prevent double-forward
-
-            # Reply only with driver forwarding confirmation
-            forwarded_notice = (
-                f"✅ Humne driver ko ({driver_number}) message kar diya hai. Woh jald respond karenge."
-            )
-            llm_reply = forwarded_notice
-            print(f"[DRIVER FWD] Reply replaced with driver confirmation for {session.get('phone_number')}")
+            driver_notification = True
+            print(f"[DRIVER FWD] Alert forwarded to driver {driver_number} for session {session.get('phone_number')}")
         else:
             print(f"[DRIVER FWD] Driver number same as sender after normalisation. Skipping forward.")
+
+    if driver_notification and ticket_created:
+        updated_collected["driver_notified"] = True
+        llm_reply = build_ticket_message(updated_collected["ticket_id"], updated_collected)
 
     final_state = llm_next_state
     return llm_reply, final_state, updated_collected
