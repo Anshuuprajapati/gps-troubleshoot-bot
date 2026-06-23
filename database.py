@@ -45,11 +45,21 @@ def init_db():
                 vehicle_location TEXT,
                 service_date    TEXT,
                 driver_phone    TEXT,
+                engineer_id     TEXT,
+                engineer_name   TEXT,
+                engineer_phone  TEXT,
+                assignment_status TEXT,
                 status          TEXT NOT NULL DEFAULT 'OPEN',
                 created_at      TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+
+        cursor.execute("PRAGMA table_info(tickets)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for col in ["engineer_id", "engineer_name", "engineer_phone", "assignment_status"]:
+            if col not in existing_columns:
+                cursor.execute(f"ALTER TABLE tickets ADD COLUMN {col} TEXT")
 
         conn.commit()
     print("[DB] Database initialized successfully.")
@@ -93,7 +103,13 @@ def get_session(phone_number: str) -> dict:
             "origin_city": None,
             "destination_city": None,
             "resume_date": None,
-            "ticket_id": None
+            "ticket_id": None,
+            "service_booking_stage": None,
+            "engineer_id": None,
+            "engineer_name": None,
+            "engineer_phone": None,
+            "assignment_status": None,
+            "conversation_completed": False
         },
         "chat_history": []
     }
@@ -170,14 +186,20 @@ def save_ticket(ticket_id: str, phone_number: str, data: dict):
     with get_connection() as conn:
         conn.execute("""
             INSERT OR IGNORE INTO tickets 
-            (ticket_id, phone_number, vehicle_location, service_date, driver_phone, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
+            (ticket_id, phone_number, vehicle_location, service_date, driver_phone,
+             engineer_id, engineer_name, engineer_phone, assignment_status,
+             status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """, (
             ticket_id,
             phone_number,
             data.get("vehicle_location"),
             data.get("service_date"),
             data.get("driver_phone"),
+            data.get("engineer_id"),
+            data.get("engineer_name"),
+            data.get("engineer_phone"),
+            data.get("assignment_status"),
             now,
             now
         ))

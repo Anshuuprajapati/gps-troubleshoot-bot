@@ -50,6 +50,60 @@ def generate_ticket_id() -> str:
     return f"TKT-{random.randint(1000, 9999)}"
 
 
+ENGINEERS = [
+    {
+        "engineer_id": "ENG-001",
+        "name": "Rajesh Kumar",
+        "phone": "9876543210",
+        "city": "Jaipur",
+        "status": "available"
+    },
+    {
+        "engineer_id": "ENG-002",
+        "name": "Amit Sharma",
+        "phone": "9876543211",
+        "city": "Delhi",
+        "status": "available"
+    },
+]
+
+
+def normalize_engineer_city(city: str) -> str:
+    if not city:
+        return ""
+    return " ".join(word.capitalize() for word in re.split(r"\s+", city.strip().lower()))
+
+
+def find_nearest_engineer(service_location: str) -> dict | None:
+    if not service_location:
+        return None
+    normalized_location = normalize_engineer_city(service_location)
+    same_city = [e for e in ENGINEERS if e["status"] == "available" and normalize_engineer_city(e["city"]) == normalized_location]
+    if same_city:
+        return same_city[0]
+    available = [e for e in ENGINEERS if e["status"] == "available"]
+    return available[0] if available else None
+
+
+def assign_engineer_to_ticket(ticket_data: dict) -> dict:
+    print(f"[ENGINEER_ASSIGNMENT] Assigning engineer for location {ticket_data.get('vehicle_location')}")
+    engineer = find_nearest_engineer(ticket_data.get("vehicle_location"))
+    if engineer:
+        ticket_data["engineer_id"] = engineer["engineer_id"]
+        ticket_data["engineer_name"] = engineer["name"]
+        ticket_data["engineer_phone"] = engineer["phone"]
+        ticket_data["assignment_status"] = "assigned"
+        engineer["status"] = "assigned"
+        print(f"[ENGINEER_FOUND] {engineer['engineer_id']} {engineer['name']} assigned")
+    else:
+        ticket_data["engineer_id"] = None
+        ticket_data["engineer_name"] = None
+        ticket_data["engineer_phone"] = None
+        ticket_data["assignment_status"] = "pending"
+        print("[ENGINEER_NOT_FOUND] No available engineer")
+    return ticket_data
+
+
 def build_ticket_message(ticket_id: str, data: dict) -> str:
     """Builds the final ticket creation confirmation message."""
     ticket_msg = (
@@ -60,14 +114,21 @@ def build_ticket_message(ticket_id: str, data: dict) -> str:
         f"📅 Service Date: {data.get('service_date', 'N/A')}\n"
         f"📞 Contact: {data.get('driver_phone', 'N/A')}\n\n"
     )
-    if data.get("driver_notified"):
-        ticket_msg += "👤 Driver ko bhi notify kar diya gaya hai.\n\n"
-    ticket_msg += (
-        f"👤 Engineer assignment jald ho jayega.\n\n"
-        f"Engineer aapse jald sampark karega.\n\n"
-        f"Koi sawal ho toh Ticket ID {ticket_id} ke saath humse sampark karein.\n\n"
-        f"Dhanyavaad!"
-    )
+    if data.get("engineer_name"):
+        ticket_msg += (
+            f"👨‍🔧 Assigned Engineer: {data.get('engineer_name')}\n"
+            f"📱 Engineer Contact: {data.get('engineer_phone')}\n\n"
+            f"Engineer aapse jald sampark karega.\n\n"
+            f"Koi sawal ho toh Ticket ID {ticket_id} ke saath humse sampark karein.\n\n"
+            f"Dhanyavaad!"
+        )
+    else:
+        ticket_msg += (
+            f"👤 Engineer assignment jald ho jayega.\n\n"
+            f"Engineer aapse jald sampark karega.\n\n"
+            f"Koi sawal ho toh Ticket ID {ticket_id} ke saath humse sampark karein.\n\n"
+            f"Dhanyavaad!"
+        )
     return ticket_msg
 
 
@@ -352,6 +413,11 @@ def is_phone_refusal_response(text: str) -> bool:
     ))
 
 
+def is_conversation_completed_response(text: str) -> bool:
+    cleaned = text.strip().lower()
+    return bool(re.search(r"\b(ok|thanks|thank you|noted|done|haan|yes|thik hai|theek hai|okey|okay)\b", cleaned))
+
+
 def add_days(days: int) -> str:
     from datetime import date, timedelta
     return (date.today() + timedelta(days=days)).isoformat()
@@ -368,11 +434,95 @@ def enrich_phone_contact(extracted: dict, user_input: str) -> dict:
     return extracted
 
 
+def user_mentions_location(user_input: str) -> bool:
+    if not user_input:
+        return False
+    city_names = [
+        "delhi", "jaipur", "ahmedabad", "mumbai", "pune", "bangalore", "hyderabad",
+        "chennai", "kolkata", "lucknow", "nagpur", "bhopal", "indore", "noida",
+        "gurgaon", "gurugram", "vadodara", "patna", "jaipur", "agra", "varanasi"
+    ]
+    if re.search(r"\b(se|mein|me|pahunch|pahuch|ja rahi|ja raha|ja rahe|jaane|gayi|gaya|jaye|jaye|aayi|aaya|hoga|hogi)\b", user_input, re.IGNORECASE):
+        return True
+    cities_regex = r"\b(" + "|".join(re.escape(city) for city in city_names) + r")\b"
+    return bool(re.search(cities_regex, user_input, re.IGNORECASE))
+
+
 def all_ticket_fields_present(collected: dict) -> bool:
     service_location = collected.get("vehicle_location")
     service_date = collected.get("service_date")
     driver_phone = collected.get("driver_phone")
     return bool(service_location and service_date and driver_phone and len(str(driver_phone)) > 0)
+
+
+ROUTE_SERVICE_CENTER_ORDER = [
+    "Delhi",
+    "Jaipur",
+    "Ahmedabad",
+    "Mumbai",
+    "Pune",
+    "Bangalore",
+    "Hyderabad",
+    "Chennai",
+    "Kolkata",
+    "Lucknow",
+    "Nagpur",
+    "Bhopal",
+]
+
+ROUTE_SERVICE_CENTER_OVERRIDES = {
+    ("Delhi", "Pune"): "Jaipur",
+    ("Pune", "Delhi"): "Jaipur",
+    ("Jaipur", "Mumbai"): "Jaipur",
+    ("Mumbai", "Jaipur"): "Jaipur",
+    ("Ahmedabad", "Delhi"): "Jaipur",
+    ("Delhi", "Ahmedabad"): "Jaipur",
+}
+
+
+def normalize_city_name(city: str) -> str:
+    if not city:
+        return ""
+    return " ".join(word.capitalize() for word in re.split(r"\s+", city.strip().lower()))
+
+
+def choose_route_service_center(origin: str, destination: str) -> str | None:
+    origin_norm = normalize_city_name(origin)
+    destination_norm = normalize_city_name(destination)
+    if not origin_norm or not destination_norm or origin_norm == destination_norm:
+        return None
+
+    override = ROUTE_SERVICE_CENTER_OVERRIDES.get((origin_norm, destination_norm))
+    if override:
+        return override
+
+    try:
+        origin_idx = ROUTE_SERVICE_CENTER_ORDER.index(origin_norm)
+        dest_idx = ROUTE_SERVICE_CENTER_ORDER.index(destination_norm)
+    except ValueError:
+        return None
+
+    if origin_idx < dest_idx:
+        route_segment = ROUTE_SERVICE_CENTER_ORDER[origin_idx + 1:dest_idx]
+    else:
+        route_segment = list(reversed(ROUTE_SERVICE_CENTER_ORDER[dest_idx:origin_idx]))
+
+    # Exclude current location and destination; suggest the next service center on route.
+    route_segment = [city for city in route_segment if city not in {origin_norm, destination_norm}]
+    return route_segment[0] if route_segment else None
+
+
+def route_service_suggestion_applicable(collected: dict) -> bool:
+    if not is_ticket_required_intent(collected.get("intent", "")):
+        return False
+    if collected.get("service_date"):
+        return False
+    origin = collected.get("origin_city")
+    destination = collected.get("destination_city")
+    if not origin or not destination or normalize_city_name(origin) == normalize_city_name(destination):
+        return False
+    suggestion = choose_route_service_center(origin, destination)
+    return bool(suggestion)
 
 
 def advance_service_booking_stage(collected: dict, user_input: str) -> dict:
@@ -392,6 +542,13 @@ def advance_service_booking_stage(collected: dict, user_input: str) -> dict:
         collected["service_booking_stage"] = "COMPLETED"
         return collected
 
+    if stage is None and route_service_suggestion_applicable(collected):
+        suggested_center = choose_route_service_center(collected["origin_city"], collected["destination_city"])
+        if suggested_center:
+            collected["suggested_route_center"] = suggested_center
+            collected["service_booking_stage"] = "ASK_ROUTE_SERVICE_CENTER"
+            return collected
+
     if service_date_exists and stage is None:
         collected["service_booking_stage"] = "ASK_SERVICE_CENTER_CONFIRMATION"
         return collected
@@ -399,6 +556,20 @@ def advance_service_booking_stage(collected: dict, user_input: str) -> dict:
     if stage is None:
         collected["service_booking_stage"] = "ASK_TOMORROW"
         return collected
+
+    if stage == "ASK_ROUTE_SERVICE_CENTER":
+        if is_affirmative_response(user_input):
+            suggested = collected.get("suggested_route_center")
+            if suggested:
+                collected["vehicle_location"] = suggested
+            collected["service_booking_stage"] = "ASK_TOMORROW"
+            return collected
+        if is_negative_response(user_input):
+            collected["service_booking_stage"] = "ASK_TOMORROW"
+            return collected
+        if collected.get("vehicle_location") and collected.get("vehicle_location") != collected.get("suggested_route_center"):
+            collected["service_booking_stage"] = "ASK_TOMORROW"
+            return collected
 
     if stage == "ASK_TOMORROW":
         if service_date_exists or is_affirmative_response(user_input):
@@ -544,6 +715,11 @@ def build_collection_reply(collected: dict) -> str:
         return "Vehicle ka location kya hai? Kahan par hai aapki vehicle?"
 
     stage = collected.get("service_booking_stage")
+    if stage == "ASK_ROUTE_SERVICE_CENTER":
+        suggested = collected.get("suggested_route_center")
+        if suggested:
+            return f"Hamara {suggested} service center route mein aata hai. Kya main {suggested} mein service schedule kar du?"
+        return "Kya main service center location suggest karun?"
     if stage == "ASK_TOMORROW":
         return "Kya main service kal book kar du?"
     if stage == "ASK_4_DAYS":
@@ -621,6 +797,10 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     if not user_input or user_input.strip() == "":
         return "Kripya apna message dobara bhejein.", current_state, collected
 
+    # ── If the ticket flow is already completed, keep the conversation closed for acknowledgements.
+    if collected.get("conversation_completed") and is_conversation_completed_response(user_input):
+        return "Dhanyavaad 😊 Hamari team aapse sampark karegi.", current_state, collected
+
     # ── Pre-process: resolve weekday phrases before LLM sees them ─────────────
     user_input = pre_process_user_input(user_input)
 
@@ -664,6 +844,10 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     new_extracted = infer_route_fields(new_extracted, user_input)
     new_extracted = post_process_extracted(new_extracted)
 
+    # ── Preserve confirmed vehicle location unless user explicitly changes it ─
+    if collected.get("vehicle_location") and not user_mentions_location(user_input):
+        new_extracted["vehicle_location"] = collected["vehicle_location"]
+
     # ── Smart merge: never lose existing data ─────────────────────────────────
     updated_collected = merge_extracted_data(collected, new_extracted)
     updated_collected = infer_route_fields(updated_collected, user_input)
@@ -691,11 +875,14 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
     if ticket_ready:
         ticket_id = generate_ticket_id()
         updated_collected["ticket_id"] = ticket_id
+        updated_collected = assign_engineer_to_ticket(updated_collected)
+        updated_collected["conversation_completed"] = True
         llm_reply = build_ticket_message(ticket_id, updated_collected)
         llm_next_state = "TICKET_RAISED"
         ticket_created = True
         print(f"\n[🎟️ TICKET CREATED] {ticket_id} for {session.get('phone_number', 'UNKNOWN')}")
         print(f"[🎟️ TICKET DATA] {json.dumps(updated_collected)}")
+        print(f"[TICKET_UPDATED] {ticket_id} saved with engineer assignment status {updated_collected.get('assignment_status')}")
         database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
 
     # ── State machine override guard ──────────────────────────────────────────
@@ -713,10 +900,13 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
         else:
             # All fields present — generate ticket and override reply
             ticket_id = generate_ticket_id()
-            llm_reply = build_ticket_message(ticket_id, updated_collected)
             updated_collected["ticket_id"] = ticket_id
+            updated_collected = assign_engineer_to_ticket(updated_collected)
+            updated_collected["conversation_completed"] = True
+            llm_reply = build_ticket_message(ticket_id, updated_collected)
             print(f"\n[🎟️ TICKET CREATED] {ticket_id} for {session.get('phone_number', 'UNKNOWN')}")
             print(f"[🎟️ TICKET DATA] {json.dumps(updated_collected)}")
+            print(f"[TICKET_UPDATED] {ticket_id} saved with engineer assignment status {updated_collected.get('assignment_status')}")
 
             # Persist ticket to its own table
             database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
@@ -739,10 +929,13 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
         phone_filled = phone and len(str(phone)) > 0
         if all([loc, date_, phone_filled]):
             ticket_id = generate_ticket_id()
-            llm_reply = build_ticket_message(ticket_id, updated_collected)
             updated_collected["ticket_id"] = ticket_id
+            updated_collected = assign_engineer_to_ticket(updated_collected)
+            updated_collected["conversation_completed"] = True
+            llm_reply = build_ticket_message(ticket_id, updated_collected)
             llm_next_state = "TICKET_RAISED"
             print(f"\n[🎟️ AUTO TICKET] {ticket_id} — all fields filled, LLM missed TICKET_RAISED state.")
+            print(f"[TICKET_UPDATED] {ticket_id} saved with engineer assignment status {updated_collected.get('assignment_status')}")
             database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
 
     # If we are still collecting required ticket fields, use deterministic prompts.
@@ -835,8 +1028,8 @@ async def process_whatsapp_webhook(request: Request):
     session = database.get_session(clean_sender)
     session["phone_number"] = clean_sender
 
-    # ── Guard: conversation already fully closed ──────────────────────────────
-    if session["current_state"] in ["TICKET_RAISED", "CASE_CLOSED"]:
+    # ── Guard: conversation already fully closed unless we're handling a polite acknowledgement.
+    if session["current_state"] in ["TICKET_RAISED", "CASE_CLOSED"] and not session["collected_json"].get("conversation_completed"):
         print(f"[SESSION] Conversation already closed (state={session['current_state']}). Ignoring further input.")
         return {"status": "conversation_closed"}
 
