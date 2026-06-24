@@ -40,25 +40,26 @@ def init_db():
         # ── Tickets table ──────────────────────────────────────────────────────
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tickets (
-                ticket_id       TEXT PRIMARY KEY,
-                phone_number    TEXT NOT NULL,
-                vehicle_location TEXT,
-                service_date    TEXT,
-                driver_phone    TEXT,
-                engineer_id     TEXT,
-                engineer_name   TEXT,
-                engineer_phone  TEXT,
+                ticket_id         TEXT PRIMARY KEY,
+                phone_number      TEXT NOT NULL,
+                vehicle_location  TEXT,
+                service_date      TEXT,
+                driver_phone      TEXT,
+                engineer_id       TEXT,
+                engineer_name     TEXT,
+                engineer_phone    TEXT,
                 assignment_status TEXT,
-                status          TEXT NOT NULL DEFAULT 'OPEN',
-                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                status            TEXT NOT NULL DEFAULT 'OPEN',
+                created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
 
+        # Add any missing columns to tickets (safe migration) ──────────────────
         cursor.execute("PRAGMA table_info(tickets)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
+        existing_ticket_cols = {row[1] for row in cursor.fetchall()}
         for col in ["engineer_id", "engineer_name", "engineer_phone", "assignment_status"]:
-            if col not in existing_columns:
+            if col not in existing_ticket_cols:
                 cursor.execute(f"ALTER TABLE tickets ADD COLUMN {col} TEXT")
 
         conn.commit()
@@ -89,7 +90,7 @@ def get_session(phone_number: str) -> dict:
             "chat_history": json.loads(row["chat_history"])
         }
 
-    # Fresh session
+    # Fresh session defaults
     return {
         "current_state": "INITIAL_ALERT",
         "collected_json": {
@@ -109,15 +110,19 @@ def get_session(phone_number: str) -> dict:
             "engineer_name": None,
             "engineer_phone": None,
             "assignment_status": None,
-            "conversation_completed": False
+            "conversation_completed": False,
+            "battery_issue": False,
+            "main_power_issue": False,
+            "root_cause": "OTHER_ISSUE",
         },
         "chat_history": []
     }
 
 
-def save_session(phone_number: str, state: str, collected_json: dict, chat_history: list):
+def save_session(phone_number: str, current_state: str, collected_json: dict, chat_history: list):
     """
     Upserts (insert or update) a session record.
+    Uses 'current_state' to match the actual column name in the DB schema.
     """
     now = datetime.utcnow().isoformat()
     with get_connection() as conn:
@@ -131,7 +136,7 @@ def save_session(phone_number: str, state: str, collected_json: dict, chat_histo
                 updated_at     = excluded.updated_at
         """, (
             phone_number,
-            state,
+            current_state,
             json.dumps(collected_json),
             json.dumps(chat_history),
             now,
@@ -185,7 +190,7 @@ def save_ticket(ticket_id: str, phone_number: str, data: dict):
     now = datetime.utcnow().isoformat()
     with get_connection() as conn:
         conn.execute("""
-            INSERT OR IGNORE INTO tickets 
+            INSERT OR IGNORE INTO tickets
             (ticket_id, phone_number, vehicle_location, service_date, driver_phone,
              engineer_id, engineer_name, engineer_phone, assignment_status,
              status, created_at, updated_at)

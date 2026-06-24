@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 import database
 from date_utils import normalize_date
+from gps_analysis_api import analyze_gps_device   # ← NEW
 
 load_dotenv()
 
@@ -30,11 +31,23 @@ database.init_db()
 # 1. Pydantic Models for JSON Validation
 # ==========================================
 
+class GpsData(BaseModel):
+    gpstime: Optional[str] = None
+    main_powervoltage: Optional[float] = None
+    ismainpoerconnected: Optional[str] = None   # "1" = connected, "0" = disconnected
+    gpsStatus: Optional[int] = None             # 0 = no fix, 1 = fix
+    driver_name: Optional[str] = None
+    driver_phone: Optional[str] = None
+    current_location: Optional[str] = None
+    vehicle_state: Optional[str] = None
+
+
 class OutageRequest(BaseModel):
     phone_number: str
     vehicle_no: str
     last_location: str
     timestamp: str
+    gps_data: Optional[GpsData] = None
 
 class TicketDetails(BaseModel):
     vehicle_location: Optional[str] = None
@@ -134,7 +147,8 @@ def build_ticket_message(ticket_id: str, data: dict) -> str:
 
 def is_case_closed_intent(intent: str) -> bool:
     """Returns True for intents that close the case without a ticket."""
-    return intent in ["WORKSHOP", "ACCIDENT", "BATTERY_DISCONNECT", "GPS_REMOVED"]
+    return intent in ["WORKSHOP", "ACCIDENT", "BATTERY_DISCONNECT", "GPS_REMOVED",
+                      "BATTERY_ISSUE", "MAIN_POWER_CUT"]          # ← NEW root causes
 
 
 def is_ticket_required_intent(intent: str) -> bool:
@@ -188,7 +202,7 @@ def forward_alert_to_driver(driver_number: str, original_session: dict) -> None:
 
     database.save_session(
         phone_number=driver_number,
-        state="INITIAL_ALERT",
+        current_state="INITIAL_ALERT",
         collected_json={
             "intent": None,
             "vehicle_location": None,
@@ -202,6 +216,10 @@ def forward_alert_to_driver(driver_number: str, original_session: dict) -> None:
             "resume_date": None,
             "ticket_id": None,
             "forwarded_from": original_session.get("phone_number"),  # audit trail
+            # Pre-analysis fields default to unknown for forwarded sessions
+            "battery_issue": False,
+            "main_power_issue": False,
+            "root_cause": "OTHER_ISSUE",
         },
         chat_history=[{"role": "bot", "text": initial_alert_msg}],
     )
@@ -211,7 +229,84 @@ def forward_alert_to_driver(driver_number: str, original_session: dict) -> None:
 
 
 # ==========================================
-# 3. GROQ SYSTEM DEFINITION
+# 3. INITIAL ALERT MESSAGE BUILDERS          ← NEW SECTION
+# ==========================================
+
+def build_battery_issue_alert(vehicle_no: str, gps_data: dict) -> str:
+    """Initial message for BATTERY_ISSUE root cause."""
+    gpstime       = gps_data.get("gpstime", "N/A")
+    last_location = gps_data.get("current_location") or gps_data.get("last_location", "N/A")
+    vehicle_state = gps_data.get("vehicle_state", "N/A")
+    return (
+        f"Hello,\n\n"
+        f"We have analyzed the GPS status for vehicle {vehicle_no}.\n"
+        f"Our system indicates a possible battery-related issue affecting the GPS device.\n\n"
+        f"Last GPS Update: {gpstime}\n"
+        f"Last Known Location: {last_location}\n"
+        f"Current Vehicle Status: {vehicle_state}\n\n"
+        f"Could you please confirm whether the vehicle battery was recently disconnected, "
+        f"replaced, serviced, or if the battery is currently discharged?\n\n"
+        f"Please let us know so we can assist you further."
+    )
+
+
+def build_main_power_cut_alert(vehicle_no: str, gps_data: dict) -> str:
+    """Initial message for MAIN_POWER_CUT root cause."""
+    gpstime       = gps_data.get("gpstime", "N/A")
+    last_location = gps_data.get("current_location") or gps_data.get("last_location", "N/A")
+    vehicle_state = gps_data.get("vehicle_state", "N/A")
+    return (
+        f"Hello,\n\n"
+        f"We have analyzed the GPS status for vehicle {vehicle_no}.\n"
+        f"Our system indicates that the GPS device may not be receiving main power from the vehicle.\n\n"
+        f"Last GPS Update: {gpstime}\n"
+        f"Last Known Location: {last_location}\n"
+        f"Current Vehicle Status: {vehicle_state}\n\n"
+        f"Could you please confirm whether there has been any recent electrical work, "
+        f"wiring issue, fuse issue, or power disconnection in the vehicle?\n\n"
+        f"Please let us know so we can assist you further."
+    )
+
+
+def build_other_issue_alert(vehicle_no: str, gps_data: dict) -> str:
+    """Initial message for OTHER_ISSUE root cause."""
+    gpstime       = gps_data.get("gpstime", "N/A")
+    driver_name   = gps_data.get("driver_name", "N/A")
+    driver_phone  = gps_data.get("driver_phone", "N/A")
+    cur_location  = gps_data.get("current_location", "N/A")
+    vehicle_state = gps_data.get("vehicle_state", "N/A")
+    return (
+        f"Hello,\n\n"
+        f"We have analyzed the GPS status for vehicle {vehicle_no}.\n"
+        f"No battery-related issue or main power issue has been detected from our side.\n\n"
+        f"Vehicle Details:\n"
+        f"• Driver Name: {driver_name}\n"
+        f"• Driver Contact: {driver_phone}\n"
+        f"• Current Location: {cur_location}\n"
+        f"• Vehicle Status: {vehicle_state}\n"
+        f"• Last GPS Update: {gpstime}\n\n"
+        f"Could you please describe the exact GPS-related issue you are facing?\n\n"
+        f"For example:\n"
+        f"• GPS location not updating\n"
+        f"• Vehicle status not showing\n"
+        f"• GPS device damaged\n"
+        f"• GPS device removed\n"
+        f"• Any other tracking issue\n\n"
+        f"Please provide details so we can assist you further."
+    )
+
+
+def build_initial_alert(vehicle_no: str, gps_data: dict, root_cause: str) -> str:
+    """Route to the correct initial message based on root cause."""
+    if root_cause == "BATTERY_ISSUE":
+        return build_battery_issue_alert(vehicle_no, gps_data)
+    if root_cause == "MAIN_POWER_CUT":
+        return build_main_power_cut_alert(vehicle_no, gps_data)
+    return build_other_issue_alert(vehicle_no, gps_data)
+
+
+# ==========================================
+# 4. LLM SYSTEM INSTRUCTION
 # ==========================================
 
 SYSTEM_INSTRUCTION = """
@@ -239,8 +334,24 @@ Process the customer's message(s) and return a single valid JSON object.
     "debug_notes": string
 }
 
-## INTENT MAPPING
-When user replies to initial alert (option number or description), map to intent:
+## PRE-ANALYSIS ROOT CAUSE CONTEXT
+The session will include a "root_cause" field set by the GPS analysis API BEFORE the first message:
+  - "BATTERY_ISSUE"   — battery disconnect or battery discharge detected
+  - "MAIN_POWER_CUT"  — main/external power supply cut detected
+  - "OTHER_ISSUE"     — neither battery nor main power; user must describe the problem
+
+## INTENT MAPPING FOR BATTERY_ISSUE ROOT CAUSE
+When root_cause = "BATTERY_ISSUE" and user replies to the battery troubleshooting prompt:
+- "1" or "haan" or "battery issue" or "disconnect" or "charge kar rahe" → intent = "BATTERY_ISSUE" → CASE_CLOSED
+- "2" or "battery theek hai" or "koi aur" → override to "OTHER_ISSUE" flow, ask standard menu
+
+## INTENT MAPPING FOR MAIN_POWER_CUT ROOT CAUSE
+When root_cause = "MAIN_POWER_CUT" and user replies to the power troubleshooting prompt:
+- "1" or "haan" or "power issue" or "fix kar rahe" → intent = "MAIN_POWER_CUT" → CASE_CLOSED
+- "2" or "power theek hai" or "koi aur" → override to "OTHER_ISSUE" flow, ask standard menu
+
+## INTENT MAPPING FOR OTHER_ISSUE ROOT CAUSE (standard 8-option menu)
+When user replies to the standard GPS issue menu (option number or description), map to intent:
 - "1" or "workshop" or "service center" → intent = "WORKSHOP"
 - "2" or "accident" → intent = "ACCIDENT"
 - "3" or "battery" or "battery disconnect" → intent = "BATTERY_DISCONNECT"
@@ -251,9 +362,11 @@ When user replies to initial alert (option number or description), map to intent
 - "8" or "other" or anything else unclear → intent = "OTHER"
 Natural language like "gadi running me hai" or "GPS update nahi ho raha chal rahi hai" → VEHICLE_RUNNING_GPS_NOT_UPDATING.
 
-## CASE CLOSED FLOW (intents: WORKSHOP, ACCIDENT, BATTERY_DISCONNECT, GPS_REMOVED)
+## CASE CLOSED FLOW (intents: WORKSHOP, ACCIDENT, BATTERY_DISCONNECT, GPS_REMOVED, BATTERY_ISSUE, MAIN_POWER_CUT)
 - If resume_date is NOT known: set next_state = "COLLECTING_DETAILS", ask ONLY "Vehicle dobara kab running condition mein aa jayegi?"
 - If resume_date IS known: set next_state = "CASE_CLOSED", reply = "✅ Update note kar liya gaya hai. Dhanyavaad."
+- SPECIAL: for BATTERY_ISSUE and MAIN_POWER_CUT — if user confirms the issue is being fixed,
+  ask "Vehicle GPS dobara kab normal ho jayega?" as the resume question, then CASE_CLOSED.
 - Do NOT create a ticket. Do NOT ask anything else.
 - RESUME DATE EXTRACTION: "parso tak theek ho jayegi" → resume_date = "parso". "kal aa jayegi" → resume_date = "kal". "3 din mein" → resume_date = "3 din mein". ANY time reference given in response to "kab running hogi" question → THAT IS resume_date, NOT arrival_date or service_date.
 
@@ -340,11 +453,15 @@ def build_execution_context(session: dict, user_input: str) -> str:
     from datetime import date
     today_str = date.today().strftime("%d %B %Y")  # e.g. "19 June 2026"
     recent_history = session["chat_history"][-10:]  # last 10 messages for context window efficiency
+    collected = session["collected_json"]
     return (
         f"TODAY'S DATE: {today_str}\n"
         f"Current Bot State: {session['current_state']}\n"
-        f"Intent Locked: {session['collected_json'].get('intent', 'NOT SET YET')}\n"
-        f"Currently Extracted Data: {json.dumps(session['collected_json'])}\n\n"
+        f"Root Cause (from GPS analysis API): {collected.get('root_cause', 'OTHER_ISSUE')}\n"
+        f"Battery Issue Detected: {collected.get('battery_issue', False)}\n"
+        f"Main Power Issue Detected: {collected.get('main_power_issue', False)}\n"
+        f"Intent Locked: {collected.get('intent', 'NOT SET YET')}\n"
+        f"Currently Extracted Data: {json.dumps(collected)}\n\n"
         f"Recent Conversation:\n"
         + "\n".join([f"{m['role'].upper()}: {m['text']}" for m in recent_history])
         + f"\nUSER: {user_input}"
@@ -352,7 +469,7 @@ def build_execution_context(session: dict, user_input: str) -> str:
 
 
 # ==========================================
-# 4. META WHATSAPP OUTBOUND UTILITY
+# 5. META WHATSAPP OUTBOUND UTILITY
 # ==========================================
 
 def send_whatsapp_meta(to_number: str, text_body: str):
@@ -378,7 +495,7 @@ def send_whatsapp_meta(to_number: str, text_body: str):
 
 
 # ==========================================
-# 5. CORE MESSAGE PROCESSING LOGIC
+# 6. CORE MESSAGE PROCESSING LOGIC
 # ==========================================
 
 def merge_extracted_data(existing: dict, new_data: dict) -> dict:
@@ -887,18 +1004,15 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
 
     # ── State machine override guard ──────────────────────────────────────────
     if not ticket_created and llm_next_state == "TICKET_RAISED":
-        # Final validation: ensure all 3 required fields are truly present
         loc = updated_collected.get("vehicle_location")
         date_ = updated_collected.get("service_date")
         phone = updated_collected.get("driver_phone")
 
-        # "NOT_PROVIDED" counts as filled (user refused, we proceed anyway)
         phone_filled = phone and len(str(phone)) > 0
         if not all([loc, date_, phone_filled]):
             print(f"[TICKET GUARD] Fields incomplete. loc={loc}, date={date_}, phone={phone}")
             llm_next_state = "COLLECTING_DETAILS"
         else:
-            # All fields present — generate ticket and override reply
             ticket_id = generate_ticket_id()
             updated_collected["ticket_id"] = ticket_id
             updated_collected = assign_engineer_to_ticket(updated_collected)
@@ -907,21 +1021,15 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
             print(f"\n[🎟️ TICKET CREATED] {ticket_id} for {session.get('phone_number', 'UNKNOWN')}")
             print(f"[🎟️ TICKET DATA] {json.dumps(updated_collected)}")
             print(f"[TICKET_UPDATED] {ticket_id} saved with engineer assignment status {updated_collected.get('assignment_status')}")
-
-            # Persist ticket to its own table
             database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
 
     elif llm_next_state == "CASE_CLOSED":
-        # Validate resume_date exists before closing
         if not updated_collected.get("resume_date") and is_case_closed_intent(locked_intent or ""):
             llm_next_state = "COLLECTING_DETAILS"
-        # CRITICAL: if locked_intent is a TICKET flow, LLM is wrong to CASE_CLOSE —
-        # user said "workshop" mid-flow but intent is already GPS_DAMAGED etc.
         elif is_ticket_required_intent(locked_intent or ""):
             print(f"[CASE_CLOSE BLOCK] Intent {locked_intent} requires ticket. Overriding CASE_CLOSED → COLLECTING_DETAILS")
             llm_next_state = "COLLECTING_DETAILS"
 
-    # ── Auto-promote to TICKET_RAISED if all fields now filled (LLM missed it) ─
     elif llm_next_state == "COLLECTING_DETAILS" and is_ticket_required_intent(locked_intent or ""):
         loc = updated_collected.get("vehicle_location")
         date_ = updated_collected.get("service_date")
@@ -938,28 +1046,24 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
             print(f"[TICKET_UPDATED] {ticket_id} saved with engineer assignment status {updated_collected.get('assignment_status')}")
             database.save_ticket(ticket_id, session.get("phone_number", ""), updated_collected)
 
-    # If we are still collecting required ticket fields, use deterministic prompts.
     if llm_next_state == "COLLECTING_DETAILS" and is_ticket_required_intent(locked_intent or ""):
         llm_reply = build_collection_reply(updated_collected)
 
     # ── Driver phone forwarding ───────────────────────────────────────────────
-    # If a driver/contact phone number was just extracted and we haven't already
-    # forwarded the alert to a driver in this session, do it now.
     raw_driver_phone = updated_collected.get("driver_phone")
-    already_forwarded = collected.get("driver_forwarded")  # flag set on first forward
+    already_forwarded = collected.get("driver_forwarded")
 
     if (
         raw_driver_phone
         and raw_driver_phone not in ("NOT_PROVIDED",)
         and not already_forwarded
-        and raw_driver_phone != session.get("phone_number")  # don't forward to self
+        and raw_driver_phone != session.get("phone_number")
     ):
         driver_number = normalize_whatsapp_number(raw_driver_phone)
-        # Extra guard: don't forward to the original sender even after normalisation
         original_normalized = normalize_whatsapp_number(session.get("phone_number", ""))
         if driver_number != original_normalized:
             forward_alert_to_driver(driver_number, session)
-            updated_collected["driver_forwarded"] = True  # prevent double-forward
+            updated_collected["driver_forwarded"] = True
             driver_notification = True
             print(f"[DRIVER FWD] Alert forwarded to driver {driver_number} for session {session.get('phone_number')}")
         else:
@@ -974,7 +1078,7 @@ def process_message(session: dict, user_input: str) -> tuple[str, str, dict]:
 
 
 # ==========================================
-# 6. SYSTEM WEBHOOKS & API CHANNELS
+# 7. SYSTEM WEBHOOKS & API CHANNELS
 # ==========================================
 
 @app.get("/api/whatsapp-webhook", response_class=PlainTextResponse)
@@ -1010,7 +1114,6 @@ async def process_whatsapp_webhook(request: Request):
         clean_sender = message_data["from"]
         message_id = message_data.get("id", "")
 
-        # ── Duplicate message prevention ──────────────────────────────────────
         if database.is_duplicate_message(message_id):
             print(f"[DUPLICATE] Skipping already-processed message_id: {message_id}")
             return {"status": "duplicate_ignored"}
@@ -1024,33 +1127,26 @@ async def process_whatsapp_webhook(request: Request):
         print(f"[PAYLOAD PARSE ERROR] {e}")
         return {"status": "malformed_meta_payload"}
 
-    # ── Load session ──────────────────────────────────────────────────────────
     session = database.get_session(clean_sender)
     session["phone_number"] = clean_sender
 
-    # ── Guard: conversation already fully closed unless we're handling a polite acknowledgement.
     if session["current_state"] in ["TICKET_RAISED", "CASE_CLOSED"] and not session["collected_json"].get("conversation_completed"):
         print(f"[SESSION] Conversation already closed (state={session['current_state']}). Ignoring further input.")
         return {"status": "conversation_closed"}
 
-    # ── Append user message to history ───────────────────────────────────────
     session["chat_history"].append({"role": "user", "text": user_input})
 
-    # ── Core processing ───────────────────────────────────────────────────────
     reply_text, next_state, updated_json = process_message(session, user_input)
 
-    # ── Append bot reply to history ───────────────────────────────────────────
     session["chat_history"].append({"role": "bot", "text": reply_text})
 
-    # ── Persist session ───────────────────────────────────────────────────────
     database.save_session(
         phone_number=clean_sender,
-        state=next_state,
+        current_state=next_state,
         collected_json=updated_json,
         chat_history=session["chat_history"]
     )
 
-    # ── Send reply ────────────────────────────────────────────────────────────
     send_whatsapp_meta(clean_sender, reply_text)
     print(f"[📤 OUTBOUND] To: {clean_sender} | State: {next_state} | Reply: {reply_text[:80]}...")
 
@@ -1059,44 +1155,112 @@ async def process_whatsapp_webhook(request: Request):
 
 @app.post("/api/trigger-outage")
 async def trigger_outage(payload: OutageRequest):
-    """API Endpoint to initialize tracking downtime alerts from backend scripts."""
-    initial_alert_msg = (
-        f"Namaste Sir,\n\n"
-        f"Vehicle {payload.vehicle_no} se GPS data receive nahi ho raha hai.\n\n"
-        f"📍 Last Known Location: {payload.last_location}\n"
-        f"🕐 Last Update: {payload.timestamp}\n\n"
-        f"Kripya batayein ki aapki vehicle ki current status kya hai:\n\n"
-        f"1️⃣ Workshop / Service Center\n"
-        f"2️⃣ Accident\n"
-        f"3️⃣ Battery Disconnect\n"
-        f"4️⃣ GPS Removed\n"
-        f"5️⃣ GPS Damaged\n"
-        f"6️⃣ Vehicle Running but GPS Not Updating\n"
-        f"7️⃣ Vehicle Standing\n"
-        f"8️⃣ Other\n\n"
-        f"Reply with the option number or describe the issue in your own words."
+    """
+    API Endpoint to initialize tracking downtime alerts from backend scripts.
+
+    Flow:
+    1. Normalize gps_data from the request payload.
+    2. Classify root cause via GPS analysis API: BATTERY_ISSUE | MAIN_POWER_CUT | OTHER_ISSUE.
+    3. Build a tailored initial WhatsApp message using gps_data fields.
+    4. Persist session with root_cause + gps_data in collected_json.
+    5. Send the WhatsApp message.
+    """
+    print(f"[🚨 OUTAGE] Received for {payload.phone_number} | Vehicle: {payload.vehicle_no}")
+
+    # ── Step 1: Normalize gps_data ────────────────────────────────────────────
+    raw_gps = payload.gps_data.model_dump() if payload.gps_data else {}
+    # Merge top-level fields as fallbacks so builders always have last_location / timestamp
+    gps_data = {
+        "last_location": payload.last_location,
+        "timestamp":     payload.timestamp,
+        **raw_gps,
+    }
+
+    # ── Step 2: Classify root cause from gps_data fields ────────────────────
+    #
+    # Priority order:
+    #   1. ismainpoerconnected == "0"          → MAIN_POWER_CUT
+    #   2. main_powervoltage present & < 11 V  → BATTERY_ISSUE
+    #   3. Fallback to external API (if URL set), else OTHER_ISSUE
+    #
+    is_main_connected = str(gps_data.get("ismainpoerconnected", "1")).strip()
+    voltage_raw       = gps_data.get("main_powervoltage")
+
+    main_power_issue = (is_main_connected == "0")
+    battery_issue    = (
+        not main_power_issue
+        and voltage_raw is not None
+        and float(voltage_raw) < 11.0
     )
 
+    if main_power_issue:
+        root_cause = "MAIN_POWER_CUT"
+    elif battery_issue:
+        root_cause = "BATTERY_ISSUE"
+    else:
+        # Neither detected from gps_data — try external API as a final check
+        analysis = analyze_gps_device(
+            vehicle_no=payload.vehicle_no,
+            phone_number=payload.phone_number,
+        )
+        root_cause       = analysis["root_cause"]
+        battery_issue    = analysis["battery_issue"]
+        main_power_issue = analysis["main_power_issue"]
+
+    print(
+        f"[🔍 PRE-ANALYSIS] root_cause={root_cause} | "
+        f"battery_issue={battery_issue} | main_power_issue={main_power_issue} | "
+        f"voltage={voltage_raw}V | main_connected={is_main_connected}"
+    )
+
+    # ── Step 3: Build tailored initial message ────────────────────────────────
+    initial_alert_msg = build_initial_alert(
+        vehicle_no=payload.vehicle_no,
+        gps_data=gps_data,
+        root_cause=root_cause,
+    )
+
+    # ── Step 4: Persist session ───────────────────────────────────────────────
     database.save_session(
         phone_number=payload.phone_number,
-        state="INITIAL_ALERT",
+        current_state="INITIAL_ALERT",
         collected_json={
-            "intent": None,
-            "vehicle_location": None,
-            "service_date": None,
-            "arrival_date": None,
-            "driver_phone": None,
-            "driver_name": None,
-            "contact_person": None,
-            "origin_city": None,
+            # Pre-analysis fields
+            "battery_issue":    battery_issue,
+            "main_power_issue": main_power_issue,
+            "root_cause":       root_cause,
+            # GPS device data from request
+            "gps_gpstime":      gps_data.get("gpstime"),
+            "gps_location":     gps_data.get("current_location") or payload.last_location,
+            "gps_vehicle_state": gps_data.get("vehicle_state"),
+            # Pre-fill driver details if provided in gps_data
+            "driver_name":      gps_data.get("driver_name"),
+            "driver_phone":     gps_data.get("driver_phone"),
+            # Standard collected fields
+            "intent":           None,
+            "vehicle_location": gps_data.get("current_location") or None,
+            "service_date":     None,
+            "arrival_date":     None,
+            "contact_person":   None,
+            "origin_city":      None,
             "destination_city": None,
-            "resume_date": None,
-            "ticket_id": None,
+            "resume_date":      None,
+            "ticket_id":        None,
             "driver_forwarded": False,
         },
         chat_history=[{"role": "bot", "text": initial_alert_msg}]
     )
 
+    # ── Step 5: Send WhatsApp message ─────────────────────────────────────────
     send_whatsapp_meta(payload.phone_number, initial_alert_msg)
-    print(f"[🚨 OUTAGE ALERT] Fired for {payload.phone_number} | Vehicle: {payload.vehicle_no}")
-    return {"status": "alert_fired"}
+    print(
+        f"[🚨 OUTAGE ALERT SENT] {payload.phone_number} | "
+        f"Vehicle: {payload.vehicle_no} | root_cause: {root_cause}"
+    )
+
+    return {
+        "status":           "alert_fired",
+        "root_cause":       root_cause,
+        "battery_issue":    battery_issue,
+        "main_power_issue": main_power_issue,
+    }
