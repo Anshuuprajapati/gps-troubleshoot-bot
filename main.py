@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from battery_issue_flow import start_battery_flow, handle_whatsapp_replies as battery_webhook, WhatsAppWebhookMessage
-from main_power_cut_flow import start_main_power_flow
+from main_power_cut_flow import start_main_power_flow, handle_whatsapp_replies as main_power_webhook
 from other_issue_flow import start_other_issue_flow
 import database
 
@@ -190,10 +190,13 @@ async def whatsapp_webhook(request: Request):
                     result = await battery_webhook(webhook_msg)
                     return result
                     
-                elif root_cause == "MAIN_POWER_CUT":
-                    # TODO: Implement main power webhook handler
-                    logger.info("Main power flow webhook - not yet implemented")
-                    return {"status": "ok", "message": "Main power flow"}
+                elif root_cause == "MAIN_POWER_CUT" or root_cause == "MAIN_POWER":
+                    webhook_msg = WhatsAppWebhookMessage(
+                        phone_number=phone_number,
+                        message_text=message_text
+                    )
+                    result = await main_power_webhook(webhook_msg)
+                    return result
                     
                 elif root_cause == "OTHER_ISSUE":
                     # TODO: Implement other issue webhook handler
