@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException, status, Request
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from battery_issue_flow import start_battery_flow, handle_whatsapp_replies as battery_webhook, WhatsAppWebhookMessage
+from battery_issue_flow import start_battery_flow, handle_whatsapp_replies as battery_webhook, WhatsAppWebhookMessage, init_db as battery_init_db
 from main_power_cut_flow import start_main_power_flow, handle_whatsapp_replies as main_power_webhook
 from other_issue_flow import start_other_issue_flow
 import database
@@ -17,6 +17,13 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(m
 logger = logging.getLogger("CentralRoutingHub")
 
 app = FastAPI(title="GPS Outage Central Routing Hub & Pre-Analysis Engine")
+
+@app.on_event("startup")
+async def startup_event():
+    database.init_db()
+    battery_init_db()
+    logger.info("Databases initialized on startup.")
+
 # ==============================================================================
 # 2. PYDANTIC SCHEMAS FOR DATA VALIDATION
 # ==============================================================================

@@ -1,38 +1,520 @@
+"""
+GPS AI Support Chatbot - Battery Issue Flow
+Complete single-file implementation covering all features from the checklist:
+  - Outage detection & PRE_ANALYSIS
+  - Full state machine with LLM brain
+  - Entity extraction (name, phone, location, date, etc.)
+  - Guidance system (how-to answers)
+  - Confusion & side-question handling
+  - Strategy change mid-conversation
+  - Driver communication & separate driver session
+  - Live GPS API recheck
+  - Intent lock after remote failure
+  - Service detail collection
+  - Engineer assignment & ticket creation
+  - Hindi / English / Hinglish support
+
+Dependencies:
+    pip install fastapi uvicorn openai python-dotenv requests
+"""
+
 import os
+import json
 import logging
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel
+import re
+import sqlite3
+import random
+import string
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+
 import requests
+from fastapi import FastAPI
+from pydantic import BaseModel
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 
-import database
-from date_utils import normalize_date
-
 load_dotenv()
 
-# Setup Logger
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
-logger = logging.getLogger("BatteryIssueFlow")
+# ──────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s | %(name)s: %(message)s"
+)
+logger = logging.getLogger("GPSChatbot")
 
-app = FastAPI(title="GPS Outage Workflow - Case 1: Battery Issue Service")
-
-# Initialize DB
-database.init_db()
-
-# Initialize Azure OpenAI Client
+# ──────────────────────────────────────────────────────────────────────────────
+# AZURE OPENAI CLIENT
+# ──────────────────────────────────────────────────────────────────────────────
 openai_client = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
 )
-AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FASTAPI APP
+# ──────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="GPS AI Support Chatbot - Battery Issue Flow")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — DATABASE LAYER (SQLite, self-contained)
+# ══════════════════════════════════════════════════════════════════════════════
+DB_PATH = os.getenv("DB_PATH", "gps_chatbot.db")
 
 
-# ==============================================================================
-# PYDANTIC DATA STRUCTS
-# ==============================================================================
+def _get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with _get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                phone_number  TEXT PRIMARY KEY,
+                current_state TEXT NOT NULL,
+                collected_json TEXT NOT NULL DEFAULT '{}',
+                chat_history   TEXT NOT NULL DEFAULT '[]',
+                updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS tickets (
+                ticket_id   TEXT PRIMARY KEY,
+                phone_number TEXT NOT NULL,
+                ticket_data  TEXT NOT NULL DEFAULT '{}',
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+
+def save_session(phone_number: str, current_state: str,
+                 collected_json: dict, chat_history: list):
+    with _get_conn() as conn:
+        conn.execute("""
+            INSERT INTO sessions (phone_number, current_state, collected_json, chat_history, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(phone_number) DO UPDATE SET
+                current_state  = excluded.current_state,
+                collected_json = excluded.collected_json,
+                chat_history   = excluded.chat_history,
+                updated_at     = CURRENT_TIMESTAMP
+        """, (phone_number, current_state,
+              json.dumps(collected_json), json.dumps(chat_history)))
+
+
+def get_session(phone_number: str) -> Optional[dict]:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE phone_number = ?", (phone_number,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "phone_number": row["phone_number"],
+        "current_state": row["current_state"],
+        "collected_json": json.loads(row["collected_json"]),
+        "chat_history": json.loads(row["chat_history"]),
+    }
+
+
+def delete_session(phone_number: str):
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM sessions WHERE phone_number = ?", (phone_number,))
+
+
+def save_ticket(ticket_id: str, phone_number: str, ticket_data: dict):
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO tickets (ticket_id, phone_number, ticket_data) VALUES (?, ?, ?)",
+            (ticket_id, phone_number, json.dumps(ticket_data))
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — DATE NORMALIZER
+# ══════════════════════════════════════════════════════════════════════════════
+
+DATE_FORMATS = [
+    "%d-%m-%Y", "%d/%m/%Y", "%d %m %Y",
+    "%d-%m-%y", "%d/%m/%y",
+    "%Y-%m-%d", "%B %d %Y", "%b %d %Y",
+]
+
+
+def normalize_date(raw: str) -> str:
+    raw = raw.strip()
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt).strftime("%d-%m-%Y")
+        except ValueError:
+            continue
+    # Relative dates
+    today = datetime.today()
+    lower = raw.lower()
+    if "kal" in lower or "tomorrow" in lower:
+        return (today + timedelta(days=1)).strftime("%d-%m-%Y")
+    if "parso" in lower or "day after" in lower:
+        return (today + timedelta(days=2)).strftime("%d-%m-%Y")
+    if "aaj" in lower or "today" in lower:
+        return today.strftime("%d-%m-%Y")
+    return raw  # Return as-is if unparseable
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — WHATSAPP META TRANSPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def send_whatsapp_meta(to_number: str, text_body: str):
+    """Dispatch a WhatsApp message via Meta Cloud API."""
+    if not to_number or to_number == "N/A":
+        logger.warning("Skipping WhatsApp send — invalid number: %s", to_number)
+        return
+    url = (
+        f"https://graph.facebook.com/v18.0/"
+        f"{os.getenv('WHATSAPP_PHONE_NUMBER_ID')}/messages"
+    )
+    headers = {
+        "Authorization": f"Bearer {os.getenv('WHATSAPP_TOKEN')}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_number,
+        "type": "text",
+        "text": {"preview_url": False, "body": text_body},
+    }
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=8)
+        if res.status_code != 200:
+            logger.error("WhatsApp dispatch failed [%s]: %s", res.status_code, res.text)
+    except Exception as exc:
+        logger.critical("WhatsApp transport error to %s: %s", to_number, exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — GPS HARDWARE API RECHECK  (mock; swap with real endpoint)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_hardware_api_recheck(vehicle_no: str) -> Dict[str, Any]:
+    """
+    Query hardware tracking API for live GPS status.
+    Returns dict with keys: gps_working, main_power_connected, main_powervoltage.
+    Replace the stub body with your real API call.
+    """
+    logger.info("Running live GPS recheck for vehicle: %s", vehicle_no)
+    try:
+        # --- REPLACE THIS WITH REAL API CALL ---
+        # response = requests.get(f"{GPS_API_BASE}/status/{vehicle_no}", timeout=5)
+        # data = response.json()
+        # return {
+        #     "gps_working": data["gpsStatus"] == 1,
+        #     "main_power_connected": data["ismainpowerconnected"],
+        #     "main_powervoltage": data["main_powervoltage"],
+        # }
+        return {
+            "gps_working": False,
+            "main_power_connected": "1",
+            "main_powervoltage": 12.4,
+        }
+    except Exception as exc:
+        logger.error("GPS API recheck failed for %s: %s", vehicle_no, exc)
+        return {"gps_working": False, "main_power_connected": "1", "main_powervoltage": 0.0}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — ENTITY EXTRACTOR
+# Extracts: phone numbers, names, locations, dates, cities from free text
+# ══════════════════════════════════════════════════════════════════════════════
+
+STOPWORDS = {
+    "ko", "bol", "do", "par", "number", "is", "iss", "se", "ka", "ki",
+    "ke", "hai", "hain", "aur", "ya", "the", "and", "or", "a", "an",
+    "please", "karo", "karna", "karein", "bata", "batao",
+}
+
+
+def parse_inline_entities(text: str) -> Dict[str, Optional[str]]:
+    """
+    Extract structured entities from a raw user message.
+    Returns a dict with optional keys: phone, name, date, location, city.
+    """
+    entities: Dict[str, Optional[str]] = {
+        "phone": None, "name": None,
+        "date": None, "location": None, "city": None,
+    }
+
+    # Phone: 10-digit Indian mobile or with 91/+91 prefix
+    phone_match = re.search(r'\b(?:\+?91)?([6-9]\d{9})\b', text)
+    if phone_match:
+        raw_phone = phone_match.group(1)
+        entities["phone"] = f"91{raw_phone}" if len(raw_phone) == 10 else raw_phone
+
+    # Date: DD-MM-YYYY, DD/MM/YYYY, or relative words
+    date_match = re.search(
+        r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|kal|parso|aaj|tomorrow|today|day after)\b',
+        text, re.IGNORECASE
+    )
+    if date_match:
+        entities["date"] = normalize_date(date_match.group(1))
+
+    # Name: capitalize non-stopword alpha words adjacent to phone or "driver"
+    clean = re.sub(r'\b(?:\+?91)?[6-9]\d{9}\b', '', text)
+    words = [
+        w.strip(".,!?") for w in clean.split()
+        if w.lower() not in STOPWORDS and re.match(r'^[A-Za-z]{3,}$', w)
+    ]
+    if words:
+        entities["name"] = words[0].capitalize()
+
+    return entities
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — LLM BRAIN  (single unified reasoning function)
+# Handles: intent, guidance, confusion, side-questions, strategy change,
+#          entity confirmation, state transitions — all in one call.
+# ══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM_BRAIN_TEMPLATE = """
+You are the AI brain for a GPS fleet-tracking support chatbot.
+You must behave like an experienced, empathetic human support executive — NOT a form.
+
+=== VEHICLE CONTEXT ===
+Vehicle No        : {vehicle_no}
+Root Cause        : {root_cause}
+Driver Name       : {driver_name}
+Driver Phone      : {driver_phone}
+Last Location     : {last_location}
+Physical Intent   : {physical_intent}
+Intent Locked     : {intent_locked}
+Current State     : {current_state}
+Extracted Phone   : {extracted_phone}
+Extracted Name    : {extracted_name}
+
+=== CONVERSATION HISTORY (last 6 turns) ===
+{history_snippet}
+
+=== STATE MACHINE RULES ===
+
+BATTERY_INITIAL_RESPONSE
+  → If user says they (owner/manager) will charge/handle it:
+      next_state: BATTERY_WAITING_FOR_CHARGE
+  → If user mentions driver, operator, or someone else:
+      next_state: BATTERY_DRIVER_CONFIRMATION
+  → If user asks how to charge, where is battery, how long, etc.:
+      Answer the question, stay in: BATTERY_INITIAL_RESPONSE
+  → If user is confused or asks "what is this"?
+      Explain patiently, stay in: BATTERY_INITIAL_RESPONSE
+  → If user asks for vehicle location or driver details:
+      Answer using context, stay in: BATTERY_INITIAL_RESPONSE
+  → If user demands engineer visit immediately:
+      Politely say let's try charging first, stay in: BATTERY_INITIAL_RESPONSE
+
+BATTERY_DRIVER_CONFIRMATION
+  → If user confirms driver or provides a number/name:
+      next_state: BATTERY_WAITING_FOR_CHARGE
+  → If user changes mind and says they will handle it:
+      next_state: BATTERY_WAITING_FOR_CHARGE
+
+BATTERY_WAITING_FOR_CHARGE
+  → If user/driver says done, charged, connected, fixed:
+      next_state: BATTERY_POST_CHECK (the system will call the GPS API automatically)
+  → If user says battery is broken / karab / needs replacement:
+      next_state: COLLECTING_SERVICE_DETAILS
+  → If user changes mind, wants driver involved:
+      next_state: BATTERY_DRIVER_CONFIRMATION
+
+BATTERY_POST_CHECK  (system decides; LLM only generates reply)
+  → If GPS API says active → next_state: COMPLETED
+  → If main power is cut → next_state: MAIN_POWER_FLOW
+  → Otherwise → next_state: AWAITING_PHYSICAL_DIAGNOSIS
+
+AWAITING_PHYSICAL_DIAGNOSIS
+  → Understand what the physical condition is.
+  → Detect intent: GPS_DAMAGED | GPS_REMOVED | WORKSHOP | ACCIDENT |
+                   VEHICLE_RUNNING | VEHICLE_STANDING | BATTERY_DISCONNECT | OTHER
+  → next_state: COLLECTING_SERVICE_DETAILS
+
+COLLECTING_SERVICE_DETAILS
+  → Collect: Current Location, Destination, ETA date, Service City, Contact Person
+  → If all 4+ fields collected: next_state: TICKET_CREATED
+  → If missing fields: remain in COLLECTING_SERVICE_DETAILS, ask for missing ones only
+
+MAIN_POWER_FLOW
+  → Explain wiring issue. Ask owner or driver to check main power connection.
+  → On confirmation of fix: next_state: BATTERY_POST_CHECK
+  → On physical damage: next_state: AWAITING_PHYSICAL_DIAGNOSIS
+
+COMPLETED / TICKET_CREATED
+  → Close conversation gracefully.
+
+=== OUTPUT FORMAT (strict JSON, no markdown) ===
+{{
+  "next_state": "<STATE_NAME>",
+  "bot_reply": "<Reply in same language as user — Hindi/English/Hinglish>",
+  "extracted_updates": {{
+    "driver_name": "<if newly provided, else null>",
+    "driver_phone": "<if newly provided, else null>",
+    "location": "<if newly provided, else null>",
+    "destination": "<if newly provided, else null>",
+    "service_city": "<if newly provided, else null>",
+    "eta_date": "<if newly provided, else null>",
+    "contact_person": "<if newly provided, else null>",
+    "physical_intent": "<if newly detected, else null>"
+  }}
+}}
+"""
+
+
+def execute_llm_brain(
+    current_state: str,
+    user_input: str,
+    context: dict,
+    chat_history: list,
+    extracted_entities: Dict[str, Optional[str]],
+) -> Tuple[str, str, dict]:
+    """
+    Single LLM call that handles ALL reasoning:
+    intent detection, guidance, confusion, side-questions,
+    strategy change, state transition, and reply generation.
+
+    Returns: (next_state, bot_reply, extracted_updates_dict)
+    """
+    # Build a readable history snippet (last 6 turns)
+    history_lines = []
+    for turn in chat_history[-6:]:
+        role = turn.get("role", "?")
+        text = turn.get("text") or turn.get("content", "")
+        history_lines.append(f"{role.upper()}: {text}")
+    history_snippet = "\n".join(history_lines) if history_lines else "(no history)"
+
+    system_prompt = SYSTEM_BRAIN_TEMPLATE.format(
+        vehicle_no=context.get("vehicle_no", "N/A"),
+        root_cause=context.get("root_cause", "BATTERY_ISSUE"),
+        driver_name=context.get("driver_name", "N/A"),
+        driver_phone=context.get("driver_phone", "N/A"),
+        last_location=context.get("last_location", "N/A"),
+        physical_intent=context.get("physical_intent", "N/A"),
+        intent_locked=context.get("intent_locked", False),
+        current_state=current_state,
+        extracted_phone=extracted_entities.get("phone") or "N/A",
+        extracted_name=extracted_entities.get("name") or "N/A",
+        history_snippet=history_snippet,
+    )
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            max_tokens=800,
+        )
+        raw = response.choices[0].message.content.strip()
+        parsed = json.loads(raw)
+        next_state = parsed.get("next_state", current_state)
+        bot_reply = parsed.get("bot_reply", "")
+        updates = parsed.get("extracted_updates", {})
+        return next_state, bot_reply, updates
+
+    except Exception as exc:
+        logger.error("LLM brain error: %s", exc, exc_info=True)
+        return current_state, "System mein thodi problem aayi. Kripya dobara try karein.", {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — ENGINEER ASSIGNMENT  (mock; replace with real DB lookup)
+# ══════════════════════════════════════════════════════════════════════════════
+
+ENGINEER_POOL = [
+    {"id": "ENG-101", "name": "Ramesh Kumar",  "phone": "919999900001", "cities": ["delhi", "noida", "gurgaon"]},
+    {"id": "ENG-102", "name": "Suresh Singh",  "phone": "919999900002", "cities": ["mumbai", "pune", "thane"]},
+    {"id": "ENG-103", "name": "Mahesh Yadav",  "phone": "919999900003", "cities": ["bangalore", "mysore"]},
+    {"id": "ENG-104", "name": "Dinesh Patel",  "phone": "919999900004", "cities": ["ahmedabad", "surat", "vadodara"]},
+    {"id": "ENG-999", "name": "Central Team",  "phone": "919999900099", "cities": []},  # fallback
+]
+
+
+def assign_engineer(service_city: str) -> dict:
+    city_lower = service_city.lower()
+    for eng in ENGINEER_POOL:
+        if any(c in city_lower for c in eng["cities"]):
+            return eng
+    return ENGINEER_POOL[-1]  # fallback: central team
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — TICKET GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_ticket_id() -> str:
+    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"TKT-{suffix}"
+
+
+def create_service_ticket(phone_number: str, context: dict) -> Tuple[str, dict]:
+    """Build and persist a service ticket. Returns (ticket_id, ticket_data)."""
+    engineer = assign_engineer(context.get("service_city", ""))
+    ticket_id = generate_ticket_id()
+    ticket_data = {
+        "vehicle_no": context.get("vehicle_no"),
+        "root_cause": context.get("root_cause"),
+        "physical_intent": context.get("physical_intent", "OTHER"),
+        "vehicle_location": context.get("location", "N/A"),
+        "destination": context.get("destination", "N/A"),
+        "service_city": context.get("service_city", "N/A"),
+        "eta_date": context.get("eta_date", "N/A"),
+        "contact_person": context.get("contact_person", "Manager"),
+        "driver_phone": context.get("driver_phone", "N/A"),
+        "engineer_id": engineer["id"],
+        "engineer_name": engineer["name"],
+        "engineer_phone": engineer["phone"],
+        "assignment_status": "ASSIGNED",
+        "created_at": datetime.now().isoformat(),
+    }
+    save_ticket(ticket_id, phone_number, ticket_data)
+    logger.info("Ticket created: %s for vehicle %s", ticket_id, ticket_data["vehicle_no"])
+    return ticket_id, ticket_data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9 — PRE-ANALYSIS  (run before first message to customer)
+# ══════════════════════════════════════════════════════════════════════════════
+
+ROOT_CAUSE_RULES = {
+    "BATTERY_ISSUE": lambda d: (
+        d.get("main_powervoltage", 99) < 11.5 or
+        str(d.get("ismainpoerconnected", "1")) == "0"  # note: typo in original field name preserved
+    ),
+    "MAIN_POWER_DISCONNECTED": lambda d: str(d.get("ismainpoerconnected", "1")) == "0",
+    "GPS_INACTIVE": lambda d: d.get("gpsStatus") == 0,
+}
+
+
+def run_pre_analysis(gps_data: dict) -> str:
+    """Determine root cause from latest GPS telemetry."""
+    for cause, check in ROOT_CAUSE_RULES.items():
+        try:
+            if check(gps_data):
+                return cause
+        except Exception:
+            pass
+    return "UNKNOWN"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — PYDANTIC SCHEMAS
+# ══════════════════════════════════════════════════════════════════════════════
+
 class GpsData(BaseModel):
     gpstime: Optional[str] = None
     main_powervoltage: Optional[float] = None
@@ -43,352 +525,346 @@ class GpsData(BaseModel):
     current_location: Optional[str] = None
     vehicle_state: Optional[str] = None
 
-class RoutedRequest(BaseModel):
-    root_cause: str
+
+class TriggerPayload(BaseModel):
     phone_number: str
     vehicle_no: str
-    last_location: str
-    timestamp: str
+    last_location: Optional[str] = "Unknown"
+    timestamp: Optional[str] = None
     gps_data: Optional[GpsData] = None
+
 
 class WhatsAppWebhookMessage(BaseModel):
     phone_number: str
     message_text: str
 
 
-async def start_battery_flow(payload: dict):
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11 — STARTUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+    logger.info("GPS Chatbot service started. DB initialized.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — TRIGGER ENDPOINT  (called by your outage detection system)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/trigger-outage")
+async def trigger_outage(payload: TriggerPayload):
     """
-    Entry point called by main.py routing logic.
-    Initializes battery issue flow.
-    """
-    return await start_battery_issue_flow(RoutedRequest(**payload))
-    
-# ==============================================================================
-# UTILITY COMM LAYER
-# ==============================================================================
-def send_whatsapp_meta(to_number: str, text_body: str):
-    """Dispatches asynchronous notification alerts over Meta API WhatsApp channel."""
-    url = f"https://graph.facebook.com/v18.0/{os.getenv('WHATSAPP_PHONE_NUMBER_ID')}/messages"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('WHATSAPP_TOKEN')}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to_number,
-        "type": "text",
-        "text": {"preview_url": False, "body": text_body}
-    }
-    try:
-        res = requests.post(url, headers=headers, json=payload, timeout=8)
-        if res.status_code != 200:
-            logger.error(f"WhatsApp dispatch failed: Code {res.status_code} - {res.text}")
-    except Exception as e:
-        logger.critical(f"Transport failure dispatching message context to {to_number}: {e}")
-
-
-def run_hardware_api_recheck(vehicle_no: str) -> Dict[str, Any]:
-    """
-    Queries hardware API systems to check if the tracking hardware has re-established comms.
-    Returns status variables derived from live telemetry.
-    """
-    logger.info(f"Initiating live system hardware API health diagnostics for vehicle {vehicle_no}")
-    try:
-        # Mocking or calling your live tracking verification layer
-        # Replace with your actual live system HTTP data query if needed
-        return {
-            "gps_working": False,            # Change to True if tracking matches device heartbeat
-            "main_power_connected": "1",     # "1" = Connected, "0" = Broken Main Line
-            "main_powervoltage": 12.4
-        }
-    except Exception as e:
-        logger.error(f"Failed parsing real-time device tracking status: {e}")
-        return {"gps_working": False, "main_power_connected": "1", "main_powervoltage": 0.0}
-
-
-# ==============================================================================
-# NATURAL LANGUAGE PROCESSING ENTITY EXTRACTION LAYER
-# ==============================================================================
-def llm_parse_text(user_input: str, system_prompt: str) -> str:
-    """Invokes downstream generative parsing model to isolate operational keys."""
-    try:
-        response = openai_client.chat.completions.create(
-            model=AZURE_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_input}
-            ],
-            temperature=0.0
-        )
-        return response.choices[0].message.content.strip().upper()
-    except Exception as e:
-        logger.error(f"LLM Parsing structural breakdown exception raised: {e}")
-        return "OTHER"
-
-
-# ==============================================================================
-# CENTRAL ANALYTICAL WEBHOOK & STATE MACHINE FOR CASE 1
-# ==============================================================================
-@app.post("/api/flow/battery-issue")
-async def start_battery_issue_flow(payload: RoutedRequest):
-    """
-    Triggered exclusively by main.py routing logic.
-    Registers session tracking states inside database layer and prompts choice routing.
+    Called when a vehicle has been offline for 24+ hours.
+    Runs PRE_ANALYSIS, stores session, sends initial WhatsApp alert.
     """
     gps_info = payload.gps_data.model_dump() if payload.gps_data else {}
-    
-    alert_msg = (
-        f"🚨 *GPS Connectivity Alert* 🚨\n\n"
-        f"Vehicle *{payload.vehicle_no}* has been offline for 24+ hours.\n"
-        f"Our backend diagnostics indicate a *Low Battery / Charge Discharge* condition.\n\n"
-        f"To restore active tracking, please let us know:\n"
-        f"👉 *Will this vehicle battery be checked and charged by You, or will your Driver handle it?*"
-    )
 
-    initial_json = {
+    # Feature 1: PRE_ANALYSIS before any customer message
+    root_cause = run_pre_analysis(gps_info)
+    logger.info("PRE_ANALYSIS for %s → root cause: %s", payload.vehicle_no, root_cause)
+
+    d_name  = gps_info.get("driver_name")  or "N/A"
+    d_phone = gps_info.get("driver_phone") or "N/A"
+    last_loc = gps_info.get("current_location") or payload.last_location or "N/A"
+
+    # Route to appropriate initial message
+    if root_cause in ("BATTERY_ISSUE",):
+        initial_msg = (
+            "🚨 *GPS Connectivity Alert* 🚨\n\n"
+            f"Vehicle *{payload.vehicle_no}* 24+ hours se offline hai.\n"
+            "Hamare backend diagnostics se pata chala: *Battery Low / Charge-Discharge issue*.\n\n"
+            "Tracking restore karne ke liye batayein:\n"
+            "👉 Kya aap khud battery check/charge karwayenge, ya driver handle karega?"
+        )
+        first_state = "BATTERY_INITIAL_RESPONSE"
+    elif root_cause == "MAIN_POWER_DISCONNECTED":
+        initial_msg = (
+            "🚨 *GPS Connectivity Alert* 🚨\n\n"
+            f"Vehicle *{payload.vehicle_no}* offline hai.\n"
+            "Diagnostics: *Main power line disconnected.*\n\n"
+            "Kripya vehicle ka main power connection check karein aur reconnect karein.\n"
+            "Kya aap ya driver ye check karenge?"
+        )
+        first_state = "MAIN_POWER_FLOW"
+    else:
+        initial_msg = (
+            "🚨 *GPS Connectivity Alert* 🚨\n\n"
+            f"Vehicle *{payload.vehicle_no}* 24+ hours se offline hai.\n"
+            "Hum GPS status investigate kar rahe hain.\n\n"
+            "Kripya vehicle ki current condition batayein."
+        )
+        first_state = "AWAITING_PHYSICAL_DIAGNOSIS"
+
+    context_store = {
         "vehicle_no": payload.vehicle_no,
-        "root_cause": "BATTERY_ISSUE",
-        "driver_name": gps_info.get("driver_name", "N/A"),
-        "driver_phone": gps_info.get("driver_phone", "N/A"),
-        "last_location": payload.last_location,
-        "battery_handler": None,  # 'CUSTOMER' or 'DRIVER'
+        "root_cause": root_cause,
+        "driver_name": d_name,
+        "driver_phone": d_phone,
+        "last_location": last_loc,
         "physical_intent": None,
-        "collected_details": {}
+        "intent_locked": False,
+        # service detail fields
+        "location": None,
+        "destination": None,
+        "service_city": None,
+        "eta_date": None,
+        "contact_person": None,
     }
 
-    database.save_session(
+    save_session(
         phone_number=payload.phone_number,
-        current_state="AWAITING_HANDLER_CONFIRMATION",
-        collected_json=initial_json,
-        chat_history=[{"role": "bot", "text": alert_msg}]
+        current_state=first_state,
+        collected_json=context_store,
+        chat_history=[{"role": "bot", "text": initial_msg}],
     )
 
-    send_whatsapp_meta(payload.phone_number, alert_msg)
-    return {"status": "success", "message": "Battery workflow state tree initialized."}
+    send_whatsapp_meta(payload.phone_number, initial_msg)
+    logger.info("Outage flow triggered for %s | state: %s", payload.phone_number, first_state)
+    return {"status": "triggered", "root_cause": root_cause, "initial_state": first_state}
 
 
-@app.post("/api/flow/battery-issue/webhook")
-async def handle_whatsapp_replies(webhook_data: WhatsAppWebhookMessage):
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 13 — MAIN WEBHOOK  (all incoming WhatsApp replies)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/webhook")
+async def handle_whatsapp_reply(webhook_data: WhatsAppWebhookMessage):
     """
-    Main state engine executing sequential tracking, validations, and ticket creation.
+    Central inbound handler. Implements the full feature checklist:
+    - Entity extraction
+    - LLM brain (guidance, confusion, side-questions, strategy change)
+    - Driver session spin-up
+    - Live GPS recheck
+    - Intent lock
+    - Ticket creation
     """
-    user_phone = webhook_data.phone_number
+    user_phone   = webhook_data.phone_number
     incoming_text = webhook_data.message_text.strip()
 
-    # Fetch active database context profile
-    session = database.get_session(user_phone)
+    # ── Load session ──────────────────────────────────────────────────────────
+    session = get_session(user_phone)
     if not session:
-        return {"status": "ignored", "reason": "No active conversation session sequence detected."}
+        logger.info("No active session for %s. Ignoring.", user_phone)
+        return {"status": "ignored", "reason": "No active session."}
 
-    state = session.get("current_state")
-    context = session.get("collected_json", {})
-    history = session.get("chat_history", [])
-    vehicle_no = context.get("vehicle_no", "Unknown")
+    current_state = session["current_state"]
+    context       = session["collected_json"]
+    history       = session["chat_history"]
+    vehicle_no    = context.get("vehicle_no", "Unknown")
 
-    logger.info(f"Processing chat session on number: {user_phone} | Current State: {state}")
+    logger.info("INCOMING [%s] state=%s | msg=%s", user_phone, current_state, incoming_text[:60])
 
-    # Append customer message to history
-    history.append({"role": "user", "content": incoming_text})
+    # ── Feature 5: Entity extraction ─────────────────────────────────────────
+    entities = parse_inline_entities(incoming_text)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STATE: AWAITING_HANDLER_CONFIRMATION (Who will charge it?)
-    # ──────────────────────────────────────────────────────────────────────────
-    if state == "AWAITING_HANDLER_CONFIRMATION":
-        prompt = (
-            "Analyze the text and determine who will charge or service the vehicle battery.\n"
-            "Options: Return exactly 'CUSTOMER' if the owner/manager says they will do it.\n"
-            "Return 'DRIVER' if they mention the driver, operator, or provide a driver's name/number.\n"
-            "Return 'OTHER' if unclear."
+    # Merge freshly extracted entities into context (non-destructively)
+    if entities.get("phone") and not context.get("driver_phone_override"):
+        context["_extracted_phone"] = entities["phone"]
+    if entities.get("name"):
+        context["_extracted_name"] = entities["name"]
+    if entities.get("date") and not context.get("eta_date"):
+        context["eta_date"] = entities["date"]
+
+    # ── Feature 6 & 4: LLM brain call ────────────────────────────────────────
+    next_state, bot_reply, llm_updates = execute_llm_brain(
+        current_state, incoming_text, context, history, entities
+    )
+
+    # Merge LLM-extracted updates into context
+    for key, val in (llm_updates or {}).items():
+        if val and val not in ("null", "N/A", ""):
+            context[key] = val
+
+    # Append turn to history
+    history.append({"role": "user",  "text": incoming_text})
+    history.append({"role": "bot",   "text": bot_reply})
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STATE-SPECIFIC SIDE EFFECTS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Driver session spin-up ────────────────────────────────────────────────
+    #    Triggered when LLM moves to BATTERY_DRIVER_CONFIRMATION AND a phone
+    #    number was extracted (owner is handing off to driver).
+    if (
+        next_state in ("BATTERY_DRIVER_CONFIRMATION", "BATTERY_WAITING_FOR_CHARGE")
+        and entities.get("phone")
+        and context.get("_extracted_phone")
+    ):
+        driver_phone = context["_extracted_phone"]
+        driver_name  = context.get("_extracted_name") or context.get("driver_name", "Driver")
+
+        # Update context with confirmed driver details
+        context["driver_phone"] = driver_phone
+        context["driver_name"]  = driver_name
+
+        # Notify owner
+        owner_ack = (
+            f"Dhanyavaad. Hum {driver_name} ({driver_phone}) ko instructions bhej rahe hain.\n"
+            "Battery charge hone ke baad GPS status verify kiya jayega."
         )
-        handler = llm_parse_text(incoming_text, prompt)
+        send_whatsapp_meta(user_phone, owner_ack)
+        history[-1]["text"] = owner_ack  # replace last bot reply
 
-        if "CUSTOMER" in handler:
-            context["battery_handler"] = "CUSTOMER"
-            next_msg = (
-                "Understood. Please arrange to charge or reconnect the vehicle's battery.\n\n"
-                "Once the battery has been reconnected and the vehicle turned on, "
-                "reply with *'DONE'* or *'CONNECTED'* so we can verify the hardware connection."
-            )
-            history.append({"role": "assistant", "content": next_msg})
-            database.save_session(user_phone, "AWAITING_CHARGE_COMPLETION", context, history)
-            send_whatsapp_meta(user_phone, next_msg)
+        # Owner session → TRANSITIONED_TO_DRIVER
+        save_session(user_phone, "TRANSITIONED_TO_DRIVER", context, history)
 
-        elif "DRIVER" in handler:
-            context["battery_handler"] = "DRIVER"
-            d_name = context.get("driver_name", "N/A")
-            d_phone = context.get("driver_phone", "N/A")
-            
-            next_msg = (
-                "Got it. We will coordinate with the driver.\n"
-                f"Please confirm the driver contact information on file:\n"
-                f"• Name: {d_name}\n"
-                f"• Phone: {d_phone}\n\n"
-                f"Is this driver information correct? Reply *'YES'* to confirm or provide the updated *Name, Number*."
-            )
-            history.append({"role": "assistant", "content": next_msg})
-            database.save_session(user_phone, "CONFIRMING_DRIVER_DETAILS", context, history)
-            send_whatsapp_meta(user_phone, next_msg)
-        else:
-            fallback = "Could you please specify clearly? Will the battery be handled by *You* or the *Driver*?"
-            send_whatsapp_meta(user_phone, fallback)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # STATE: CONFIRMING_DRIVER_DETAILS
-    # ──────────────────────────────────────────────────────────────────────────
-    elif state == "CONFIRMING_DRIVER_DETAILS":
-        if "YES" in incoming_text.upper():
-            driver_phone = context.get("driver_phone")
-            driver_msg = (
-                f"Hello, your office/manager reported that Vehicle *{vehicle_no}* is offline due to a low battery.\n\n"
-                f"Please ensure the vehicle battery is fully connected or charged.\n"
-                f"Once done, please reply to this number with *'DONE'* to restore tracking tracking updates."
-            )
-            # Route alert message down to target driver hardware operator
-            if driver_phone and driver_phone != "N/A":
-                send_whatsapp_meta(driver_phone, driver_msg)
-
-            mgr_msg = f"Thank you. Notification sent to driver. Awaiting charge confirmation from either party."
-            history.append({"role": "assistant", "content": mgr_msg})
-            database.save_session(user_phone, "AWAITING_CHARGE_COMPLETION", context, history)
-            send_whatsapp_meta(user_phone, mgr_msg)
-        else:
-            # Simple text capture parsing logic to update driver info variables
-            parts = incoming_text.split(",")
-            if len(parts) >= 2:
-                context["driver_name"] = parts[0].strip()
-                context["driver_phone"] = ''.join(filter(str.isdigit, parts[1].strip()))
-                
-                # Resend verification to driver phone sequence
-                send_whatsapp_meta(context["driver_phone"], f"Alert: Please charge the battery for vehicle {vehicle_no} and reply DONE.")
-                msg = "Driver details updated. We have dispatched notifications to the driver."
-                history.append({"role": "assistant", "content": msg})
-                database.save_session(user_phone, "AWAITING_CHARGE_COMPLETION", context, history)
-                send_whatsapp_meta(user_phone, msg)
-            else:
-                send_whatsapp_meta(user_phone, "Please provide driver updates in format: *Driver Name, Phone Number* or reply *YES*.")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # STATE: AWAITING_CHARGE_COMPLETION -> SYSTEM API RECHECK
-    # ──────────────────────────────────────────────────────────────────────────
-    elif state == "AWAITING_CHARGE_COMPLETION":
-        # Check if user or driver confirms task completion
-        if "DONE" in incoming_text.upper() or "CONNECT" in incoming_text.upper():
-            send_whatsapp_meta(user_phone, "🔄 *Running Live System Diagnostic API Recheck... Please wait.*")
-            
-            # RUN SYSTEM API RECHECK
-            api_status = run_hardware_api_recheck(vehicle_no)
-            
-            if api_status.get("gps_working") is True:
-                success_msg = f"✅ *Success!* Vehicle {vehicle_no} GPS status is now fully active. Case closed."
-                database.delete_session(user_phone) # Close session out successfully
-                send_whatsapp_meta(user_phone, success_msg)
-            else:
-                # GPS is still offline -> RUN MAIN POWER CHECK BRANCH
-                logger.info("Battery reported fixed but hardware telemetry remains offline. Branching to Main Power Check.")
-                
-                if api_status.get("main_power_connected") == "0":
-                    # MAIN POWER CUT DETECTED
-                    power_cut_msg = (
-                        "⚠️ *Main Power Cut Detected* ⚠️\n\n"
-                        "The battery issue appears fixed, but our diagnostics reveal that the device "
-                        "is not receiving external vehicle power. The main wiring power line may be disconnected or cut.\n\n"
-                        "Redirecting your query to our Main Power Line team for next steps..."
-                    )
-                    send_whatsapp_meta(user_phone, power_cut_msg)
-                    # Delete active sub-session and forward execution payload outward to power flow service
-                    database.delete_session(user_phone)
-                    # (Implementation detail: Invoke main power microservice handler route)
-                else:
-                    # Power connected but GPS still offline -> PROCEED TO PHYSICAL GPS DIAGNOSIS
-                    msg = (
-                        "📊 *Diagnostic Update*:\n"
-                        "Battery levels look fine and main power lines are connected, but your GPS device is still offline.\n\n"
-                        "To narrow down the root cause, *please describe the current vehicle condition.*"
-                    )
-                    history.append({"role": "assistant", "content": msg})
-                    database.save_session(user_phone, "AWAITING_PHYSICAL_DIAGNOSIS", context, history)
-                    send_whatsapp_meta(user_phone, msg)
-        else:
-            send_whatsapp_meta(user_phone, "Please reply with *'DONE'* once the battery hardware has been charged and reconnected.")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # STATE: PHYSICAL GPS DIAGNOSIS (Intent processing framework)
-    # ──────────────────────────────────────────────────────────────────────────
-    elif state == "AWAITING_PHYSICAL_DIAGNOSIS":
-        intent_prompt = (
-            "Analyze the statement detailing vehicle conditions and classify into exactly ONE of these options:\n"
-            "• GPS_DAMAGED (device broken)\n"
-            "• GPS_REMOVED (device taken out)\n"
-            "• WORKSHOP (vehicle undergoing repairs/maintenance)\n"
-            "• ACCIDENT (vehicle crashed)\n"
-            "• VEHICLE_RUNNING_NOT_UPDATING (vehicle moving but tracking frozen)\n"
-            "• VEHICLE_STANDING (parked long term)\n"
-            "• OTHER (general text replies)\n"
-            "Output only the classification key string."
+        # Driver session
+        driver_msg = (
+            f"Hello, kya aap Vehicle *{vehicle_no}* ke sath hain?\n\n"
+            "Is gaadi ka GPS offline hai — battery low detect hui hai.\n"
+            "Kripya battery check karke charge karwayein aur hone ke baad\n"
+            "yahan *'DONE'* reply karein."
         )
-        detected_intent = llm_parse_text(incoming_text, intent_prompt)
-        context["physical_intent"] = detected_intent
-        
-        logger.info(f"Locked System Intent for {vehicle_no} -> {detected_intent}")
-        
-        # Advance state to collect dispatch scheduling parameters
-        collect_msg = (
-            f"Intent Registered: Physical issue category parsed (*{detected_intent}*).\n\n"
-            f"To schedule a field service assignment, please provide the details in this format:\n"
-            f"`Current Location, Destination, Arrival Date (DD-MM-YYYY), Service City, Contact Person Name`"
+        driver_ctx = context.copy()
+        save_session(
+            phone_number=driver_phone,
+            current_state="BATTERY_WAITING_FOR_CHARGE",
+            collected_json=driver_ctx,
+            chat_history=[{"role": "bot", "text": driver_msg}],
         )
-        history.append({"role": "assistant", "content": collect_msg})
-        database.save_session(user_phone, "COLLECTING_SERVICE_DETAILS", context, history)
-        send_whatsapp_meta(user_phone, collect_msg)
+        send_whatsapp_meta(driver_phone, driver_msg)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STATE: COLLECTING_SERVICE_DETAILS -> TICKET GENERATION
-    # ──────────────────────────────────────────────────────────────────────────
-    elif state == "COLLECTING_SERVICE_DETAILS":
-        details = incoming_text.split(",")
-        if len(details) >= 4:
-            curr_loc = details[0].strip()
-            dest = details[1].strip()
-            raw_date = details[2].strip()
-            srv_city = details[3].strip()
-            contact = details[4].strip() if len(details) > 4 else "Manager"
+        logger.info("Driver session created for %s (vehicle %s)", driver_phone, vehicle_no)
+        return {"status": "driver_session_created", "driver": driver_phone}
 
-            norm_date = normalize_date(raw_date)
-            ticket_id = f"TKT-BATT-{os.urandom(2).hex().upper()}"
+    # ── GPS live recheck after charge completion ──────────────────────────────
+    if next_state == "BATTERY_POST_CHECK":
+        send_whatsapp_meta(user_phone, "🔄 *Live GPS diagnostic chal rahi hai... please wait.*")
+        api_result = run_hardware_api_recheck(vehicle_no)
 
-            # Prepare structured dictionary context block for table writes
-            ticket_data = {
-                "vehicle_location": curr_loc,
-                "service_date": norm_date,
-                "driver_phone": context.get("driver_phone", "N/A"),
-                "engineer_id": "ENG-991",
-                "engineer_name": "Ramesh Kumar", # Auto-assignment logic
-                "engineer_phone": "919999988888",
-                "assignment_status": "ASSIGNED"
-            }
+        if api_result.get("gps_working"):
+            success_msg = f"✅ *GPS Active!* Vehicle {vehicle_no} ka tracking normal hai. Issue resolve ho gaya. 🎉"
+            send_whatsapp_meta(user_phone, success_msg)
+            delete_session(user_phone)
+            logger.info("Session closed — GPS verified for %s", vehicle_no)
+            return {"status": "resolved", "vehicle": vehicle_no}
 
-            # Commit ticket entity straight to persistence layer via database module
-            database.save_ticket(ticket_id, user_phone, ticket_data)
+        elif api_result.get("main_power_connected") == "0":
+            next_state = "MAIN_POWER_FLOW"
+            bot_reply = (
+                "⚠️ *Main Power Issue Detected*\n\n"
+                "Battery theek lag rahi hai, lekin GPS ko vehicle se power nahi mil rahi.\n"
+                "Main wiring connection check karna hoga.\n\n"
+                "Kya aap ya driver wiring check karenge?"
+            )
+        else:
+            next_state = "AWAITING_PHYSICAL_DIAGNOSIS"
+            bot_reply = (
+                "📊 Battery aur main power dono theek hain, lekin GPS abhi bhi offline hai.\n\n"
+                "Iska matlab koi physical issue ho sakta hai.\n"
+                "Kripya vehicle ki current condition describe karein\n"
+                "(e.g., workshop mein hai, accident hua, device damaged dikh raha hai, etc.)"
+            )
 
-            confirm_msg = (
-                f"🎫 *Service Ticket Created Successfully!*\n\n"
+    # ── Intent lock after physical diagnosis ─────────────────────────────────
+    if (
+        next_state == "COLLECTING_SERVICE_DETAILS"
+        and not context.get("intent_locked")
+        and context.get("physical_intent")
+    ):
+        context["intent_locked"] = True
+        logger.info("Intent locked for %s: %s", vehicle_no, context["physical_intent"])
+
+    # ── Ticket creation ───────────────────────────────────────────────────────
+    if next_state == "TICKET_CREATED":
+        # Verify we have minimum fields; ask for missing ones
+        required = ["location", "service_city"]
+        missing  = [f for f in required if not context.get(f)]
+        if missing:
+            next_state = "COLLECTING_SERVICE_DETAILS"
+            bot_reply = (
+                "Almost done! Sirf ye details chahiye:\n"
+                + "\n".join(f"• {f.replace('_', ' ').title()}" for f in missing)
+                + "\nFormat: Location, Destination, Date (DD-MM-YYYY), Service City, Contact Name"
+            )
+        else:
+            ticket_id, ticket_data = create_service_ticket(user_phone, context)
+            bot_reply = (
+                f"🎫 *Service Ticket Created!*\n\n"
                 f"• *Ticket ID:* {ticket_id}\n"
-                f"• *Issue Intent:* {context.get('physical_intent')}\n"
-                f"• *Scheduled Service City:* {srv_city}\n"
-                f"• *Target Target Date:* {norm_date}\n"
-                f"• *Assigned Engineer:* {ticket_data['engineer_name']} ({ticket_data['engineer_phone']})\n\n"
-                f"Our engineer will coordinate with {contact} prior to arrival."
+                f"• *Issue:* {context.get('physical_intent', 'OTHER')}\n"
+                f"• *Service City:* {ticket_data['service_city']}\n"
+                f"• *Date:* {ticket_data['eta_date']}\n"
+                f"• *Engineer:* {ticket_data['engineer_name']} ({ticket_data['engineer_phone']})\n\n"
+                f"Engineer aapke contact person {ticket_data['contact_person']} se "
+                f"arrival se pehle coordinate karenge."
             )
-            
-            database.delete_session(user_phone) # Tear down conversation tree context block
-            send_whatsapp_meta(user_phone, confirm_msg)
-        else:
-            error_retry = (
-                "⚠️ *Format Incorrect*.\n\n"
-                "Please send the ticket data in a comma-separated format precisely:\n"
-                "`Current Location, Destination, Arrival Date (DD-MM-YYYY), Service City, Contact Name`"
-            )
-            send_whatsapp_meta(user_phone, error_retry)
 
-    return {"status": "processed"}
+    # ── Session cleanup on completion ─────────────────────────────────────────
+    if next_state in ("COMPLETED", "TICKET_CREATED") and not context.get("intent_locked") is False:
+        send_whatsapp_meta(user_phone, bot_reply)
+        delete_session(user_phone)
+        logger.info("Session closed for %s | final state: %s", user_phone, next_state)
+        return {"status": "completed", "final_state": next_state}
+
+    # ── Persist and respond ───────────────────────────────────────────────────
+    save_session(user_phone, next_state, context, history)
+    send_whatsapp_meta(user_phone, bot_reply)
+
+    logger.info("State transition [%s]: %s → %s", user_phone, current_state, next_state)
+    return {"status": "processed", "transition": f"{current_state} → {next_state}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 14 — HEALTH CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "GPS AI Support Chatbot"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 15 — COMPATIBILITY ALIASES
+# main.py imports these exact names:
+#   from battery_issue_flow import start_battery_flow, handle_whatsapp_replies, WhatsAppWebhookMessage
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def start_battery_flow(payload: dict):
+    """
+    Alias called by main.py routing logic when root_cause == BATTERY_ISSUE.
+    Converts the raw dict payload from the central router into a TriggerPayload
+    and delegates to trigger_outage().
+    """
+    from fastapi import Request as _Request
+
+    gps_raw = payload.get("gps_data") or {}
+    gps_model = GpsData(
+        gpstime=gps_raw.get("gpstime"),
+        main_powervoltage=gps_raw.get("main_powervoltage"),
+        ismainpoerconnected=gps_raw.get("ismainpoerconnected"),
+        gpsStatus=gps_raw.get("gpsStatus"),
+        driver_name=gps_raw.get("driver_name"),
+        driver_phone=gps_raw.get("driver_phone"),
+        current_location=gps_raw.get("current_location"),
+        vehicle_state=gps_raw.get("vehicle_state"),
+    ) if gps_raw else None
+
+    trigger = TriggerPayload(
+        phone_number=payload["phone_number"],
+        vehicle_no=payload["vehicle_no"],
+        last_location=payload.get("last_location", "Unknown"),
+        timestamp=payload.get("timestamp"),
+        gps_data=gps_model,
+    )
+    return await trigger_outage(trigger)
+
+
+async def handle_whatsapp_replies(webhook_data: WhatsAppWebhookMessage):
+    """
+    Alias called by main.py webhook router when root_cause == BATTERY_ISSUE.
+    Delegates directly to handle_whatsapp_reply().
+    """
+    return await handle_whatsapp_reply(webhook_data)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("battery_issue_flow:app", host="0.0.0.0", port=8000, reload=True)
