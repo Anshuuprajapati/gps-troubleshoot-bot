@@ -13,3 +13,4 @@ test_bot.db
 bot_sessions.db
 Extra.txt
 test_main_power_flow.py
+gps_chatbot.db
