@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 from battery_issue_flow import start_battery_flow, handle_whatsapp_replies as battery_webhook, WhatsAppWebhookMessage, init_db as battery_init_db
 from main_power_cut_flow import start_main_power_flow, handle_whatsapp_replies as main_power_webhook
-from other_issue_flow import start_other_issue_flow
+from other_issue_flow import start_other_issue_flow, handle_whatsapp_replies as other_issue_webhook
 import database
 
 load_dotenv()
@@ -206,9 +206,12 @@ async def whatsapp_webhook(request: Request):
                     return result
                     
                 elif root_cause == "OTHER_ISSUE":
-                    # TODO: Implement other issue webhook handler
-                    logger.info("Other issue flow webhook - not yet implemented")
-                    return {"status": "ok", "message": "Other issue flow"}
+                    webhook_msg = WhatsAppWebhookMessage(
+                        phone_number=phone_number,
+                        message_text=message_text
+                    )
+                    result = await other_issue_webhook(webhook_msg)
+                    return result
                     
                 else:
                     logger.warning(f"Unknown root cause: {root_cause}")
