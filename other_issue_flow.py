@@ -401,6 +401,18 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
                     reply_msg = f"{prefix_reply}Aapke current route par *{loc} service point* upalabdh hai. Kya hum aaj *shaam* tak inspection schedule kar dein?"
                 else:
                     reply_msg = f"{prefix_reply}Aapke area ke hisab se *{loc} service counter* check ho sakta hai. Kya hum isko *kal* ke liye fix karein?"
+                
+                # APPEND DRIVER CONFIRMATION IF DETAILS EXIST
+                if collected.get("driver_name") or collected.get("driver_phone"):
+                    d_name = collected.get("driver_name") or "Not Available"
+                    d_phone = collected.get("driver_phone") or "Not Available"
+                    reply_msg += (
+                        f"\n\nHumare paas driver ki details available hain:\n\n"
+                        f"* Driver Name: {d_name}\n"
+                        f"* Driver Contact: {d_phone}\n\n"
+                        f"Ya koi aur number dena hai ya ise ko save kar le ??"
+                    )
+                
                 chat_hist.append({"role": "bot", "text": reply_msg})
                 database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
                 send_whatsapp_meta(phone, reply_msg)
@@ -431,12 +443,12 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
                     send_whatsapp_meta(phone, reply_msg)
                     return {"status": "collecting_next_trip_details"}
                 else:
-                    # Map finalized next trip vectors straight down to operational properties
                     collected["service_date"] = collected["next_trip_date"]
                     collected["vehicle_location"] = collected["next_trip_location"]
 
-        # Step D: Extract active driver phone parameters if missing
-        if not collected.get("driver_phone"):
+        # Step D: Extract active driver phone parameters if missing or user wants to update
+        # If user said "save this", LLM will keep existing phone. If they provide a new one, it updates.
+        if not collected.get("driver_phone") or collected.get("driver_phone") == "NOT_PROVIDED":
             reply_msg = f"{prefix_reply}Driver ka active mobile number share kijiye taaki technician coordinate kar sake."
             chat_hist.append({"role": "bot", "text": reply_msg})
             database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
