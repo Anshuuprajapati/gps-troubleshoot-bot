@@ -4,7 +4,7 @@ import random
 import re
 import logging
 from typing import Optional, Dict, Any
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import requests
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
@@ -104,33 +104,126 @@ Your job is to analyze the conversation history and the latest message to determ
 - OTHER: Unclear issue or side-chatter.
 
 ## CRITICAL OPERATIONAL LOGIC:
-1. **Entity Extraction**: Extract `vehicle_location`, `driver_name`, `driver_phone`, `workshop_name`, `resume_date` (when the vehicle runs again), and `service_date` (when an engineer fixes it).
-2. **Scheduling Loop Tracking**:
+1. **Entity Extraction**: Extract `current_location` (for VEHICLE_RUNNING from-location), `destination_location` (for VEHICLE_RUNNING to-location), `vehicle_location` (for other intents), `service_city` (preferred service city), `driver_name`, `driver_phone`, `workshop_name`, `resume_date` (when the vehicle runs again), `service_date` (when an engineer fixes it), and `contact_person` (who will coordinate with engineer).
+
+2. **VEHICLE_RUNNING Special Fields**:
+   - `current_location`: Where the vehicle is driving from
+   - `destination_location`: Where the vehicle is going to
+   - `service_city_confirmed`: true if user agrees to Delhi, false if they reject Delhi, null if not asked yet
+   - `service_city`: The actual city where they want service (only if Delhi rejected)
+
+3. **Scheduling Loop Tracking**:
    - If a slot suggestion is rejected, look at the last `scheduling_step` value.
    - If the user explicitly rejects the suggested time, increment the `scheduling_step` or mark `step_rejected: true` so the code can advance to the next strategy level (+4 days, +5 days, +7 days, then Next Trip details).
    - If they agree to a location/date or supply one themselves, capture it immediately.
-3. **GPS_REMOVED Rule**: If the tracker is self-removed, look out for whether they want a service engineer visit (`wants_service_visit`). If they don't, we will just close the loop on `resume_date`.
+
+4. **GPS_REMOVED Rule**: If the tracker is self-removed, look out for whether they want a service engineer visit (`wants_service_visit`). If they don't, we will just close the loop on `resume_date`.
 
 ## RESPONSE SCHEMA (STRICT - Return ONLY valid JSON):
 {
   "intent": "WORKSHOP" | "ACCIDENT" | "VEHICLE_RUNNING" | "VEHICLE_STANDING" | "GPS_DAMAGED" | "GPS_REMOVED" | "OTHER" | null,
   "entities": {
+    "current_location": string or null,
+    "destination_location": string or null,
     "vehicle_location": string or null,
+    "service_city": string or null,
     "driver_phone": string or null,
     "driver_name": string or null,
     "workshop_name": string or null,
     "resume_date": string or null,
     "service_date": string or null,
     "next_trip_date": string or null,
-    "next_trip_location": string or null
+    "next_trip_location": string or null,
+    "contact_person": string or null
   },
+  "service_city_confirmed": boolean | null,
   "wants_service_visit": boolean | null,
   "is_in_workshop_currently": boolean | null,
   "slot_rejected": boolean,
   "side_question_reply": string or null,
   "conversational_reply": string
 }
+
+5. **Driver Verification Rule (VEHICLE_RUNNING)**: If `verifying_driver` is true and the user agrees (e.g., "Haa", "yes", "correct"), set the extracted `contact_person` to the value of `driver_name` and `driver_phone` to the driver's phone. If they provide a completely new name or phone number instead, extract those into `contact_person` and update `driver_phone` accordingly, and mark `contact_person_rejected: true`.
+
+6. **Date Alternative Selection (VEHICLE_RUNNING)**: If the user responds to the 3 scheduling options:
+   - If they select option "1" or say "after 2 days", calculate the target date as today + 2 days, and map it into `entities.service_date`.
+   - If they select option "2" or say "after 4 days", calculate the target date as today + 4 days, and map it into `entities.service_date`.
+   - If they pick option "3" or specify an explicit date/relative timeline (e.g., "5 din baad", "05-07-2026"), extract that information into `entities.service_date`.
+   - Ensure `slot_rejected` is marked as false once they choose one of these options so the flow can advance to Step F.
 """
+
+async def create_service_ticket_flow(phone: str, collected: dict, chat_hist: list):
+    """Create service ticket and send confirmation"""
+    try:
+        # Generate ticket ID
+        ticket_id = f"TKT-{''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))}"
+        
+        # Determine service city
+        if collected.get("service_city"):
+            service_city = collected["service_city"]
+        elif collected.get("service_city_confirmed") == True:
+            # Use destination if they confirmed it, otherwise fallback
+            service_city = collected.get("destination_location") or "Delhi"
+        else:
+            service_city = "Delhi"  # Default fallback
+        
+        # Determine service date
+        if collected.get("service_date"):
+            service_date = collected["service_date"]
+        else:
+            # Default to tomorrow if user agreed to "kal"
+            tomorrow = date.today() + timedelta(days=1)
+            service_date = tomorrow.strftime("%d-%m-%Y")
+        
+        # Create ticket data
+        ticket_data = {
+            "vehicle_no": collected.get("vehicle_no"),
+            "intent": collected.get("intent"),
+            "current_location": collected.get("current_location"),
+            "destination_location": collected.get("destination_location"),
+            "service_city": service_city,
+            "service_date": service_date,
+            # FALLBACK: If contact_person is empty, use driver_name
+            "contact_person": collected.get("contact_person") or collected.get("driver_name") or "Driver",
+            "driver_phone": collected.get("driver_phone") if collected.get("driver_phone") != "NOT_PROVIDED" else phone,
+            "driver_name": collected.get("driver_name"),
+            "status": "OPEN"
+        }   
+        
+        # Save ticket to database
+        database.save_ticket(ticket_id, phone, ticket_data)
+        collected["ticket_id"] = ticket_id
+        
+        # Send confirmation message
+        reply_msg = (
+            f"🎫 *Service Ticket Created Successfully!*\n\n"
+            f"• *Ticket ID:* {ticket_id}\n"
+            f"• *Vehicle:* {collected.get('vehicle_no')}\n"
+            f"• *Issue:* GPS not updating while running\n"
+            f"• *Current Location:* {collected.get('current_location')}\n"
+            f"• *Destination:* {collected.get('destination_location')}\n"
+            f"• *Service City:* {service_city}\n"
+            f"• *Service Date:* {service_date}\n"
+            f"• *Contact Person:* {collected.get('contact_person', 'Manager')}\n\n"
+            f"Hamare engineer aapke contact person se coordinate karenge service ke liye. Dhanyavaad!"
+        )
+        
+        chat_hist.append({"role": "bot", "text": reply_msg})
+        database.save_session(phone, "TICKET_CREATED", collected, chat_hist)
+        send_whatsapp_meta(phone, reply_msg)
+        
+        # Clean up session after successful ticket creation
+        database.delete_session(phone)
+        
+        return {"status": "ticket_created", "ticket_id": ticket_id}
+        
+    except Exception as e:
+        logger.error(f"Error creating service ticket: {e}")
+        error_msg = "Ticket create karne mein problem aayi. Please try again."
+        send_whatsapp_meta(phone, error_msg)
+        return {"status": "error", "message": str(e)}
+
 
 def merge_extracted_data(existing: dict, new_data: dict) -> dict:
     merged = dict(existing)
@@ -185,6 +278,10 @@ async def start_other_issue_flow(payload: dict):
             "standing_hours": standing_hrs,
             "intent": None,
             "vehicle_location": last_location or None,
+            "current_location": None,  # For VEHICLE_RUNNING: where driving from
+            "destination_location": None,  # For VEHICLE_RUNNING: where going to
+            "service_city": None,  # Preferred service city
+            "service_city_confirmed": None,  # True/False for Delhi preference
             "service_date": None,
             "resume_date": None,
             "next_trip_date": None,
@@ -192,6 +289,7 @@ async def start_other_issue_flow(payload: dict):
             "driver_phone": gps_data.get("driver_phone"),
             "driver_name": gps_data.get("driver_name"),
             "workshop_name": None,
+            "contact_person": None,
             "is_in_workshop_currently": None,
             "wants_service_visit": None,
             "scheduling_step": 0, 
@@ -259,6 +357,8 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
         collected["is_in_workshop_currently"] = brain["is_in_workshop_currently"]
     if brain.get("wants_service_visit") is not None:
         collected["wants_service_visit"] = brain["wants_service_visit"]
+    if brain.get("service_city_confirmed") is not None:
+        collected["service_city_confirmed"] = brain["service_city_confirmed"]
 
     # Normalize Dates Deterministically
     if ext_entities.get("service_date"):
@@ -372,9 +472,111 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
         # If user explicitly wants service, auto-converge cleanly down to Service Slot-Filling
         pass
 
-    # 5. CORE FIELD SERVICE SLOT-FILLING ENGINE
-    # Triggers for: VEHICLE_RUNNING, GPS_DAMAGED, VEHICLE_STANDING (<48h), and GPS_REMOVED (when visit is True)
-    if current_intent in ["VEHICLE_RUNNING", "GPS_DAMAGED", "VEHICLE_STANDING", "GPS_REMOVED"]:
+    # 5. VEHICLE RUNNING SPECIFIC FLOW
+    if current_intent == "VEHICLE_RUNNING":
+        # Step A: Ask current location (from where)
+        if not collected.get("current_location"):
+            reply_msg = f"{prefix_reply}Aapki gaadi abhi kis location par hai? (Current location batayein)"
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "collecting_current_location"}
+
+        # Step B: Ask destination (where going)
+        if not collected.get("destination_location"):
+            reply_msg = f"{prefix_reply}Kahan ja rahe hain? (Destination batayein)"
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "collecting_destination"}
+
+        # Step C: Suggest service city (Delhi by default)
+        if collected.get("service_city_confirmed") is None and not collected.get("service_city"):
+            suggested_city = collected.get("destination_location") or "Delhi"
+            
+            reply_msg = f"{prefix_reply}Kya hum {suggested_city} mein service book kar dein?"
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "asking_service_city_preference"}
+
+        # Step D: If Delhi rejected, ask preferred service city
+        if collected.get("service_city_confirmed") == False and not collected.get("service_city"):
+            reply_msg = f"{prefix_reply}Kaun se city mein service chahiye? (Preferred city batayein)"
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "collecting_preferred_service_city"}
+
+        # Step E: Ask service date
+        if not collected.get("service_date"):
+            step = collected.get("scheduling_step", 0)
+            
+            # If the user rejected a previous slot, increment the step tracker
+            if brain.get("slot_rejected") is True:
+                step += 1
+                collected["scheduling_step"] = step
+                # Clear slot_rejected flag so it doesn't trigger on consecutive turns blindly
+                brain["slot_rejected"] = False 
+
+            # Tier 0: Initial question (Tomorrow)
+            if step == 0:
+                reply_msg = f"{prefix_reply}Kya kal service book kar dein?"
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
+                return {"status": "asking_service_date_tomorrow"}
+            
+            # Tier 1: User said "Nahi" to tomorrow -> Show the 3 structured options
+            else:
+                reply_msg = (
+                    f"{prefix_reply}Please choose one option from below:\n\n"
+                    f"1️⃣ Book service after 2 days\n"
+                    f"2️⃣ Book service after 4 days\n"
+                    f"3️⃣ Enter a specific date or tell after how many days..."
+                )
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
+                return {"status": "negotiating_alternative_service_date"}  # <--- THIS RETURN IS CRITICAL
+
+        # Step F: Collect contact person if needed
+        if not collected.get("contact_person") and not collected.get("contact_person_rejected"):
+            d_name = collected.get("driver_name")
+            d_phone = collected.get("driver_phone")
+
+            # Scenario A: We have driver details in the session data
+            if d_name or d_phone:
+                d_name_str = d_name or "Not Available"
+                d_phone_str = d_phone or "Not Available"
+                
+                reply_msg = (
+                    f"{prefix_reply}Humare paas driver ki details available hain:\n\n"
+                    f"👤 *Driver Name:* {d_name_str}\n"
+                    f"📞 *Driver Contact:* {d_phone_str}\n\n"
+                    f"Kya hum unse hi coordinate karein? (Haan batayein ya unka alternative number/naam share karein)"
+                )
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                
+                # Set a state tracker so the LLM brain knows we are verifying the driver
+                collected["verifying_driver"] = True 
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
+                return {"status": "verifying_existing_driver"}
+                
+            # Scenario B: No driver details found at all upstream
+            else:
+                reply_msg = f"{prefix_reply}Service coordination ke liye contact person ka naam aur mobile number kya hai?"
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
+                return {"status": "collecting_contact_person"}
+        # All details collected - create ticket
+        return await create_service_ticket_flow(phone, collected, chat_hist)
+
+    # 6. CORE FIELD SERVICE SLOT-FILLING ENGINE FOR OTHER INTENTS
+    # Triggers for: GPS_DAMAGED, VEHICLE_STANDING (<48h), and GPS_REMOVED (when visit is True)
+    elif current_intent in ["GPS_DAMAGED", "VEHICLE_STANDING", "GPS_REMOVED"]:
         
         # Step A: Validate Current City Presence
         if not collected.get("vehicle_location"):
