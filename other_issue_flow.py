@@ -241,6 +241,116 @@ def is_phone_refusal_response(text: str) -> bool:
     ))
 
 
+def is_affirmative_response(text: str) -> bool:
+    cleaned = text.strip().lower()
+    return bool(re.search(r"\b(haan|ha|yes|y|ok|okay|theek|thik|sahi|bilkul|confirm|correct)\b", cleaned))
+
+
+def detect_contact_choice(text: str) -> Optional[str]:
+    cleaned = text.strip().lower()
+    if re.search(r"\b(khud|self|main|hum|owner|mai|me)\b", cleaned):
+        return "self"
+    if re.search(r"\b(driver|driver se|driver ko|driver ka|unse)\b", cleaned):
+        return "driver"
+    if re.search(r"\b(kisi aur|koi aur|other|dusra|dusre|contact person|contact person se|manager|supervisor)\b", cleaned):
+        return "other"
+    return None
+
+
+def extract_phone_number(text: str) -> Optional[str]:
+    match = re.search(r"\b(\d{10,13})\b", text)
+    return match.group(1) if match else None
+
+
+def build_troubleshooting_prompt(current_intent: Optional[str], collected: dict, standing_hours: float) -> str:
+    if current_intent == "WORKSHOP":
+        return "Workshop/Service center ka naam kya hai?"
+
+    if current_intent == "ACCIDENT":
+        return "Kya gaadi abhi kisi workshop ya garage me khadi hai?"
+
+    if current_intent == "VEHICLE_RUNNING":
+        if not collected.get("current_location"):
+            return "Aapki gaadi abhi kis location par hai? (Current location batayein)"
+        if not collected.get("destination_location"):
+            return "Kahan ja rahe hain? (Destination batayein)"
+        if collected.get("service_city_confirmed") is None and not collected.get("service_city"):
+            suggested_city = collected.get("destination_location") or "Delhi"
+            return f"Kya hum {suggested_city} mein service book kar dein?"
+        if collected.get("service_city_confirmed") == False and not collected.get("service_city"):
+            return "Kaun se city mein service chahiye? (Preferred city batayein)"
+        if not collected.get("service_date"):
+            return "Kya kal service book kar dein?"
+        if not collected.get("contact_person") and not collected.get("contact_person_rejected"):
+            d_name = collected.get("driver_name")
+            d_phone = collected.get("driver_phone")
+            if d_name or d_phone:
+                d_name_str = d_name or "Not Available"
+                d_phone_str = d_phone or "Not Available"
+                return (
+                    "Humare paas driver ki details available hain:\n\n"
+                    f"👤 *Driver Name:* {d_name_str}\n"
+                    f"📞 *Driver Contact:* {d_phone_str}\n\n"
+                    "Kya hum unse hi coordinate karein? (Haan batayein ya unka alternative number/naam share karein)"
+                )
+            return "Service coordination ke liye contact person ka naam aur mobile number kya hai?"
+        return "Kripya apni next update share kijiye."
+
+    if current_intent == "GPS_REMOVED":
+        if not collected.get("resume_date"):
+            return "GPS device vehicle me wapas kab tak connect/reinstall ho jayega?"
+        if collected.get("wants_service_visit") is None:
+            return "Kya aapko reinstall karne ke liye hamare physical service engineer ki zaroorat hai?"
+        if collected.get("wants_service_visit") is False:
+            return "✅ Sahi hai, aap jab device plug karenge tracking start ho jayegi. Case update log kar diya hai."
+
+    if current_intent == "VEHICLE_STANDING" and standing_hours > 48:
+        if not collected.get("resume_date"):
+            return "Gaadi 48 ghante se jyada se stationary hai. Agli trip kis date ko nikalne wali hai?"
+
+    if not collected.get("vehicle_location"):
+        return "Gaadi abhi kis city/location par chal rahi hai?"
+
+    return "Kripya vehicle ki sthiti short me batayein."
+
+
+def reassign_troubleshooting_contact(
+    original_phone: str,
+    target_phone: str,
+    collected: dict,
+    chat_hist: list,
+    current_state: str,
+    current_intent: Optional[str],
+    standing_hours: float,
+    status_note: Optional[str] = None,
+):
+    collected["original_customer_phone"] = collected.get("original_customer_phone") or original_phone
+    collected["active_contact_phone"] = target_phone
+    collected["contact_mode"] = "driver" if target_phone == collected.get("driver_phone") else "other"
+
+    intro_message = collected.get("initial_alert_msg")
+    if not intro_message:
+        for entry in chat_hist:
+            if entry.get("role") == "bot" and entry.get("text"):
+                intro_message = entry.get("text")
+                break
+
+    if original_phone != target_phone:
+        original_session = dict(collected)
+        original_session["status_only"] = True
+        database.save_session(original_phone, "STATUS_ONLY", original_session, list(chat_hist))
+        if status_note:
+            send_whatsapp_meta(original_phone, status_note)
+
+    new_history = list(chat_hist)
+    if original_phone != target_phone and intro_message:
+        send_whatsapp_meta(target_phone, intro_message)
+    prompt = build_troubleshooting_prompt(current_intent, collected, standing_hours)
+    new_history.append({"role": "bot", "text": prompt})
+    database.save_session(target_phone, current_state, collected, new_history)
+    send_whatsapp_meta(target_phone, prompt)
+
+
 # ==============================================================================
 # ENTRY ROUTE FOR CENTRAL HUB
 # ==============================================================================
@@ -288,6 +398,11 @@ async def start_other_issue_flow(payload: dict):
             "next_trip_location": None,
             "driver_phone": gps_data.get("driver_phone"),
             "driver_name": gps_data.get("driver_name"),
+            "initial_alert_msg": initial_alert_msg,
+            "original_customer_phone": phone_number,
+            "active_contact_phone": phone_number,
+            "contact_mode": None,
+            "status_only": False,
             "workshop_name": None,
             "contact_person": None,
             "is_in_workshop_currently": None,
@@ -317,6 +432,15 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
     current_state = session.get("current_state", "INITIAL_ALERT")
     collected = session.get("collected_json", {})
     chat_hist = session.get("chat_history", [])
+
+    if current_state == "STATUS_ONLY":
+        status_contact = collected.get("contact_person") or collected.get("driver_name") or "selected contact"
+        status_reply = f"Update: hum {status_contact} ke sath troubleshooting continue kar rahe hain. Aapko sirf status updates milte rahenge."
+        chat_hist.append({"role": "user", "text": message})
+        chat_hist.append({"role": "bot", "text": status_reply})
+        database.save_session(phone, current_state, collected, chat_hist)
+        send_whatsapp_meta(phone, status_reply)
+        return {"status": "status_only_update"}
 
     # Keep a running short memory
     llm_messages = []
@@ -374,8 +498,145 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
     chat_hist.append({"role": "user", "text": message})
     prefix_reply = f"{brain.get('side_question_reply')}\n\n" if brain.get('side_question_reply') else ""
 
-    # Check Standing Duration Condition Threshold Upstream
     standing_hours = collected.get("standing_hours", 0.0)
+
+    if current_state == "INITIAL_ALERT" and current_intent in {"VEHICLE_RUNNING", "GPS_DAMAGED", "VEHICLE_STANDING", "GPS_REMOVED"}:
+        reply_msg = f"{prefix_reply}Kya aap khud GPS issue check karenge, ya hum driver ya kisi aur contact person se baat karein?"
+        chat_hist.append({"role": "bot", "text": reply_msg})
+        collected["troubleshooting_contact_requested"] = True
+        database.save_session(phone, "AWAITING_TROUBLESHOOTING_CONTACT", collected, chat_hist)
+        send_whatsapp_meta(phone, reply_msg)
+        return {"status": "awaiting_troubleshooting_contact"}
+
+    if current_state == "AWAITING_TROUBLESHOOTING_CONTACT":
+        contact_choice = detect_contact_choice(message)
+        phone_in_message = extract_phone_number(message)
+
+        if phone_in_message and contact_choice is None:
+            collected["contact_mode"] = "other"
+            new_name = brain.get("entities", {}).get("contact_person") or brain.get("entities", {}).get("driver_name")
+            if new_name:
+                collected["contact_person"] = new_name
+            collected["driver_phone"] = phone_in_message
+            collected["active_contact_phone"] = phone_in_message
+            reassign_troubleshooting_contact(
+                phone,
+                phone_in_message,
+                collected,
+                chat_hist,
+                "COLLECTING_DETAILS",
+                current_intent,
+                standing_hours,
+                "Update: aapne alternate contact share kar diya hai. Hum troubleshooting naye contact ke saath continue kar rahe hain.",
+            )
+            return {"status": "other_contact_handoff_completed"}
+
+        if contact_choice == "self":
+            collected["contact_mode"] = "self"
+            collected["active_contact_phone"] = phone
+            reply_msg = f"{prefix_reply}Theek hai, hum aapke saath hi troubleshooting continue karte hain."
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "self_handoff_completed"}
+
+        if contact_choice == "driver":
+            collected["contact_mode"] = "driver"
+            reply_msg = (
+                f"{prefix_reply}Humare paas driver ki details available hain:\n\n"
+                f"👤 *Driver Name:* {collected.get('driver_name') or 'Not Available'}\n"
+                f"📞 *Driver Contact:* {collected.get('driver_phone') or 'Not Available'}\n\n"
+                "Kya aap in details ko confirm karte hain, ya driver ka naya naam/number share karenge?"
+            )
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "AWAITING_DRIVER_CONFIRMATION", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "awaiting_driver_confirmation"}
+
+        if contact_choice == "other":
+            collected["contact_mode"] = "other"
+            reply_msg = f"{prefix_reply}Theek hai. Kripya contact person's name (optional) aur mobile number bhejiye."
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "AWAITING_OTHER_CONTACT_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "awaiting_other_contact_details"}
+
+        reply_msg = f"{prefix_reply}Kya aap khud GPS issue check karenge, ya hum driver ya kisi aur contact person se baat karein?"
+        chat_hist.append({"role": "bot", "text": reply_msg})
+        database.save_session(phone, "AWAITING_TROUBLESHOOTING_CONTACT", collected, chat_hist)
+        send_whatsapp_meta(phone, reply_msg)
+        return {"status": "awaiting_troubleshooting_contact"}
+
+    if current_state == "AWAITING_DRIVER_CONFIRMATION":
+        driver_phone = extract_phone_number(message)
+        new_contact_name = brain.get("entities", {}).get("contact_person") or brain.get("entities", {}).get("driver_name")
+        if is_affirmative_response(message):
+            target_phone = collected.get("driver_phone") or phone
+            collected["contact_mode"] = "driver"
+            collected["active_contact_phone"] = target_phone
+            collected["contact_person"] = collected.get("driver_name") or collected.get("contact_person") or "Driver"
+            reassign_troubleshooting_contact(
+                phone,
+                target_phone,
+                collected,
+                chat_hist,
+                "COLLECTING_DETAILS",
+                current_intent,
+                standing_hours,
+                "Update: customer ne driver confirmation de di hai. Hum troubleshooting driver ke saath continue kar rahe hain.",
+            )
+            return {"status": "driver_handoff_completed"}
+
+        if driver_phone:
+            collected["contact_mode"] = "driver"
+            collected["driver_phone"] = driver_phone
+            if new_contact_name:
+                collected["driver_name"] = new_contact_name
+            collected["contact_person"] = new_contact_name or collected.get("driver_name") or "Driver"
+            reassign_troubleshooting_contact(
+                phone,
+                driver_phone,
+                collected,
+                chat_hist,
+                "COLLECTING_DETAILS",
+                current_intent,
+                standing_hours,
+                "Update: driver details update ho gayi hain. Hum troubleshooting naye driver ke saath continue kar rahe hain.",
+            )
+            return {"status": "driver_handoff_updated"}
+
+        reply_msg = f"{prefix_reply}Please driver ko confirm karein ya naya naam/number bhej dein."
+        chat_hist.append({"role": "bot", "text": reply_msg})
+        database.save_session(phone, "AWAITING_DRIVER_CONFIRMATION", collected, chat_hist)
+        send_whatsapp_meta(phone, reply_msg)
+        return {"status": "awaiting_driver_confirmation"}
+
+    if current_state == "AWAITING_OTHER_CONTACT_DETAILS":
+        new_phone = extract_phone_number(message) or brain.get("entities", {}).get("driver_phone")
+        if not new_phone:
+            reply_msg = f"{prefix_reply}Kripya contact person's mobile number bhejiye."
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "AWAITING_OTHER_CONTACT_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "awaiting_other_contact_details"}
+
+        new_name = brain.get("entities", {}).get("contact_person") or brain.get("entities", {}).get("driver_name")
+        if new_name:
+            collected["contact_person"] = new_name
+        collected["driver_phone"] = new_phone
+        collected["contact_mode"] = "other"
+        collected["active_contact_phone"] = new_phone
+        reassign_troubleshooting_contact(
+            phone,
+            new_phone,
+            collected,
+            chat_hist,
+            "COLLECTING_DETAILS",
+            current_intent,
+            standing_hours,
+            "Update: alternate contact add ho gaya hai. Ab troubleshooting naye contact ke saath continue ho rahi hai.",
+        )
+        return {"status": "other_contact_handoff_completed"}
 
     # ==========================================================================
     # WORKFLOW BRANCH ROUTING
