@@ -108,13 +108,21 @@ async def trigger_outage(payload: OutageRequest):
     root_cause = analyze_and_route_outage(payload)
 
     # 2. Wrap payload with computed pre-analysis metadata for downline processing
+    gps_payload = payload.gps_data.model_dump() if payload.gps_data else {}
     forward_payload = {
         "root_cause": root_cause,
         "phone_number": payload.phone_number,
         "vehicle_no": payload.vehicle_no,
         "last_location": payload.last_location,
         "timestamp": payload.timestamp,
-        "gps_data": payload.gps_data.model_dump() if payload.gps_data else None
+        "gps_data": gps_payload,
+        "gpstime": gps_payload.get("gpstime"),
+        "main_powervoltage": gps_payload.get("main_powervoltage"),
+        "ismainpoerconnected": gps_payload.get("ismainpoerconnected"),
+        "gpsStatus": gps_payload.get("gpsStatus"),
+        "vehicle_state": gps_payload.get("vehicle_state"),
+        "driver_name": gps_payload.get("driver_name"),
+        "driver_phone": gps_payload.get("driver_phone")
     }
 
     # 3. Call appropriate flow handler directly
@@ -236,19 +244,25 @@ async def whatsapp_webhook(request: Request):
 
 class SessionUpdateRequest(BaseModel):
     phone_number: str
-    updates: dict = Field(..., description="Fields to update in session")
+    current_state: Optional[str] = None
+    payload: Optional[dict] = None
+    gps_snapshot: Optional[dict] = None
+    collected_json: Optional[dict] = None
+    gps_data: Optional[dict] = None
+    append_chat_history: Optional[list] = None
+    replace_chat_history: Optional[list] = None
 
 @app.put("/api/test/update-session")
 async def update_session_for_testing(payload: SessionUpdateRequest):
     """
-    Temporary API for testing - allows updating session data during conversation.
-    
-    Use this to simulate state changes, GPS data updates, etc. without real actions.
+    Temporary API for testing - allows updating live session data during conversation.
+
+    Use this to simulate state changes, GPS data updates, and chat history updates in a
+    running flow without resetting the session.
     """
     try:
         phone = payload.phone_number
-        updates = payload.updates
-        
+
         # Get current session
         session = database.get_session(phone)
         if not session:
@@ -256,30 +270,85 @@ async def update_session_for_testing(payload: SessionUpdateRequest):
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No active session found for {phone}"
             )
-        
+
         old_state = session.get("current_state")
         old_data = session.get("collected_json", {}).copy()
-        
-        # Apply updates
-        new_state = updates.get("current_state", old_state)
         collected_json = session.get("collected_json", {})
         history = session.get("chat_history", [])
-        
-        # Update collected_json fields
-        if "collected_json" in updates:
-            for key, value in updates["collected_json"].items():
+        new_state = payload.current_state or old_state
+
+        def merge_gps_fields(gps_updates: dict):
+            collected_json["gps_data"] = collected_json.get("gps_data", {}) or {}
+            for key, value in gps_updates.items():
+                if value is None:
+                    collected_json["gps_data"].pop(key, None)
+                    if key in [
+                        "gpstime",
+                        "main_powervoltage",
+                        "ismainpoerconnected",
+                        "gpsStatus",
+                        "driver_name",
+                        "driver_phone",
+                        "current_location",
+                        "vehicle_state",
+                    ]:
+                        collected_json.pop(key, None)
+                    continue
+
+                collected_json["gps_data"][key] = value
+                if key in [
+                    "gpstime",
+                    "main_powervoltage",
+                    "ismainpoerconnected",
+                    "gpsStatus",
+                    "driver_name",
+                    "driver_phone",
+                    "current_location",
+                    "vehicle_state",
+                ]:
+                    collected_json[key] = value
+
+        # Merge payload object updates like GET payload
+        if payload.payload:
+            for key, value in payload.payload.items():
+                if key == "gps_data" and isinstance(value, dict):
+                    merge_gps_fields(value)
+                    continue
                 collected_json[key] = value
-        
-        # Update GPS data if provided
-        if "gps_data" in updates:
-            for key, value in updates["gps_data"].items():
+
+        # Merge snapshot object updates like GET gps_snapshot
+        if payload.gps_snapshot:
+            for key, value in payload.gps_snapshot.items():
+                if key == "gps_data" and isinstance(value, dict):
+                    merge_gps_fields(value)
+                    continue
+                if key == "phone_number":
+                    continue
+                if key == "current_state":
+                    new_state = value
+                    continue
                 collected_json[key] = value
-        
+
+        # Merge general collected_json updates
+        if payload.collected_json:
+            for key, value in payload.collected_json.items():
+                collected_json[key] = value
+
+        # Merge direct gps_data updates if provided
+        if payload.gps_data:
+            merge_gps_fields(payload.gps_data)
+
+        # Update chat history in real time if requested
+        if payload.replace_chat_history is not None:
+            history = payload.replace_chat_history
+        elif payload.append_chat_history:
+            history.extend(payload.append_chat_history)
+
         # Save updated session
         database.save_session(phone, new_state, collected_json, history)
-        
+
         logger.info(f"[TEST API] Updated session for {phone}: State {old_state} -> {new_state}")
-        
+
         return {
             "status": "updated",
             "phone_number": phone,
@@ -287,9 +356,10 @@ async def update_session_for_testing(payload: SessionUpdateRequest):
             "new_state": new_state,
             "old_data": old_data,
             "new_data": collected_json,
+            "chat_history": history,
             "message": "Session updated successfully for testing"
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -297,6 +367,92 @@ async def update_session_for_testing(payload: SessionUpdateRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update session: {str(e)}"
+        )
+
+
+@app.get("/api/test/get-gps-data/{phone_number}")
+async def get_gps_data_for_testing(phone_number: str):
+    """
+    Get the current GPS-related session snapshot for a phone number.
+
+    This is useful during a live flow to inspect the latest GPS data,
+    routing state, and user/contact details without modifying the session.
+    """
+    try:
+        session = database.get_session(phone_number)
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No session found for {phone_number}"
+            )
+
+        collected = session.get("collected_json", {})
+        gps_data = collected.get("gps_data", {}) or {}
+        fallback_keys = [
+            "gpstime",
+            "main_powervoltage",
+            "ismainpoerconnected",
+            "gpsStatus",
+            "driver_name",
+            "driver_phone",
+            "current_location",
+            "vehicle_state",
+        ]
+        for key in fallback_keys:
+            if key not in gps_data and collected.get(key) is not None:
+                gps_data[key] = collected.get(key)
+        if not gps_data:
+            gps_data = {
+                key: collected.get(key)
+                for key in fallback_keys
+                if collected.get(key) is not None
+            }
+        gps_payload = {
+            "phone_number": phone_number,
+            "vehicle_no": collected.get("vehicle_no"),
+            "last_location": collected.get("last_location"),
+            "timestamp": collected.get("timestamp"),
+            "gps_data": gps_data,
+        }
+
+        gps_snapshot = {
+            "phone_number": phone_number,
+            "current_state": session.get("current_state"),
+            "root_cause": collected.get("root_cause"),
+            "vehicle_no": collected.get("vehicle_no"),
+            "last_location": collected.get("last_location"),
+            "timestamp": collected.get("timestamp"),
+            "gps_data": gps_data,
+            "driver_name": collected.get("driver_name"),
+            "driver_phone": collected.get("driver_phone"),
+            "current_location": collected.get("current_location"),
+            "destination_location": collected.get("destination_location"),
+            "vehicle_location": collected.get("vehicle_location"),
+            "service_city": collected.get("service_city"),
+            "service_city_confirmed": collected.get("service_city_confirmed"),
+            "service_date": collected.get("service_date"),
+            "resume_date": collected.get("resume_date"),
+            "contact_person": collected.get("contact_person"),
+            "active_contact_phone": collected.get("active_contact_phone"),
+            "contact_mode": collected.get("contact_mode"),
+            "status_only": collected.get("status_only", False),
+            "standing_hours": collected.get("standing_hours"),
+        }
+
+        return {
+            "status": "found",
+            "phone_number": phone_number,
+            "payload": gps_payload,
+            "gps_snapshot": gps_snapshot,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching GPS snapshot: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch GPS snapshot: {str(e)}"
         )
 
 

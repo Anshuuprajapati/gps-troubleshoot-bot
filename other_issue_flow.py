@@ -262,6 +262,120 @@ def extract_phone_number(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def get_backend_gps_snapshot(phone_number: str) -> Optional[dict]:
+    backend_url = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
+    try:
+        resp = requests.get(f"{backend_url}/api/test/get-gps-data/{phone_number}", timeout=6)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"Unable to call backend GPS snapshot API: {e}")
+
+    # Fallback to local session data if API is not reachable
+    session = database.get_session(phone_number)
+    if not session:
+        return None
+    collected = session.get("collected_json", {})
+    gps_data = collected.get("gps_data", {}) or {}
+    fallback_keys = [
+        "gpstime",
+        "main_powervoltage",
+        "ismainpoerconnected",
+        "gpsStatus",
+        "driver_name",
+        "driver_phone",
+        "current_location",
+        "vehicle_state",
+    ]
+    for key in fallback_keys:
+        if key not in gps_data and collected.get(key) is not None:
+            gps_data[key] = collected.get(key)
+
+    gps_payload = {
+        "phone_number": phone_number,
+        "vehicle_no": collected.get("vehicle_no"),
+        "last_location": collected.get("last_location"),
+        "timestamp": collected.get("timestamp"),
+        "gps_data": gps_data,
+    }
+    gps_snapshot = {
+        "phone_number": phone_number,
+        "current_state": session.get("current_state"),
+        "root_cause": collected.get("root_cause"),
+        "vehicle_no": collected.get("vehicle_no"),
+        "last_location": collected.get("last_location"),
+        "timestamp": collected.get("timestamp"),
+        "gps_data": gps_data,
+        "driver_name": collected.get("driver_name"),
+        "driver_phone": collected.get("driver_phone"),
+        "current_location": collected.get("current_location"),
+        "destination_location": collected.get("destination_location"),
+        "vehicle_location": collected.get("vehicle_location"),
+        "service_city": collected.get("service_city"),
+        "service_city_confirmed": collected.get("service_city_confirmed"),
+        "service_date": collected.get("service_date"),
+        "resume_date": collected.get("resume_date"),
+        "contact_person": collected.get("contact_person"),
+        "active_contact_phone": collected.get("active_contact_phone"),
+        "contact_mode": collected.get("contact_mode"),
+        "status_only": collected.get("status_only", False),
+        "standing_hours": collected.get("standing_hours"),
+    }
+    return {"status": "found", "payload": gps_payload, "gps_snapshot": gps_snapshot}
+
+
+def is_gps_online(snapshot: dict) -> bool:
+    gps_data = snapshot.get("payload", {}).get("gps_data") or snapshot.get("gps_snapshot", {}).get("gps_data")
+    if not gps_data:
+        return False
+    if gps_data.get("gpsStatus") == 1:
+        return True
+    return False
+
+
+def close_self_repair_case(phone: str, collected: dict, chat_hist: list) -> dict:
+    reply = "✅ GPS data receive hona shuru ho gaya hai. Issue resolve ho gaya hai. Dhanyavaad!"
+    chat_hist.append({"role": "bot", "text": reply})
+    database.save_session(phone, "CASE_CLOSED", collected, chat_hist)
+    send_whatsapp_meta(phone, reply)
+    database.delete_session(phone)
+    return {"status": "self_repair_case_closed", "message": "gps_online"}
+
+
+def prompt_self_repair_step(phone: str, collected: dict, chat_hist: list, state: str, prompt: str) -> dict:
+    chat_hist.append({"role": "bot", "text": prompt})
+    database.save_session(phone, state, collected, chat_hist)
+    send_whatsapp_meta(phone, prompt)
+    return {"status": "self_repair_prompt_sent", "state": state}
+
+
+def start_self_repair_flow(phone: str, collected: dict, chat_hist: list, current_intent: Optional[str], standing_hours: float) -> dict:
+    active_phone = collected.get("active_contact_phone") or phone
+    snapshot = get_backend_gps_snapshot(active_phone)
+    if snapshot and is_gps_online(snapshot):
+        return close_self_repair_case(phone, collected, chat_hist)
+
+    prompt = "Kripya ek baar ignition ON hai ya nahi check kijiye."
+    return prompt_self_repair_step(phone, collected, chat_hist, "SELF_REPAIR_IGNITION", prompt)
+
+
+def advance_self_repair_to_next_step(phone: str, collected: dict, chat_hist: list, next_state: str, prompt: str) -> dict:
+    return prompt_self_repair_step(phone, collected, chat_hist, next_state, prompt)
+
+
+def perform_self_repair_check_and_continue(phone: str, collected: dict, chat_hist: list, next_state: str, next_prompt: str) -> dict:
+    active_phone = collected.get("active_contact_phone") or phone
+    snapshot = get_backend_gps_snapshot(active_phone)
+    if snapshot and is_gps_online(snapshot):
+        return close_self_repair_case(phone, collected, chat_hist)
+    return advance_self_repair_to_next_step(phone, collected, chat_hist, next_state, next_prompt)
+
+
+def is_pata_nahi_response(text: str) -> bool:
+    cleaned = text.strip().lower()
+    return bool(re.search(r"\b(pata nahi|pata nahin|pata nhi|dont know|unknown|not sure)\b", cleaned))
+
+
 def build_troubleshooting_prompt(current_intent: Optional[str], collected: dict, standing_hours: float) -> str:
     if current_intent == "WORKSHOP":
         return "Workshop/Service center ka naam kya hai?"
@@ -323,6 +437,7 @@ def reassign_troubleshooting_contact(
     current_intent: Optional[str],
     standing_hours: float,
     status_note: Optional[str] = None,
+    explicit_prompt: Optional[str] = None,
 ):
     collected["original_customer_phone"] = collected.get("original_customer_phone") or original_phone
     collected["active_contact_phone"] = target_phone
@@ -345,10 +460,11 @@ def reassign_troubleshooting_contact(
     new_history = list(chat_hist)
     if original_phone != target_phone and intro_message:
         send_whatsapp_meta(target_phone, intro_message)
-    prompt = build_troubleshooting_prompt(current_intent, collected, standing_hours)
+    prompt = explicit_prompt or build_troubleshooting_prompt(current_intent, collected, standing_hours)
     new_history.append({"role": "bot", "text": prompt})
     database.save_session(target_phone, current_state, collected, new_history)
     send_whatsapp_meta(target_phone, prompt)
+    return {"status": "self_repair_prompt_sent", "state": current_state}
 
 
 # ==============================================================================
@@ -386,6 +502,12 @@ async def start_other_issue_flow(payload: dict):
             "last_location": last_location,
             "timestamp": timestamp,
             "standing_hours": standing_hrs,
+            "gps_data": gps_data,
+            "gpstime": gps_data.get("gpstime"),
+            "main_powervoltage": gps_data.get("main_powervoltage"),
+            "ismainpoerconnected": gps_data.get("ismainpoerconnected"),
+            "gpsStatus": gps_data.get("gpsStatus"),
+            "vehicle_state": gps_data.get("vehicle_state"),
             "intent": None,
             "vehicle_location": last_location or None,
             "current_location": None,  # For VEHICLE_RUNNING: where driving from
@@ -519,26 +641,22 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
                 collected["contact_person"] = new_name
             collected["driver_phone"] = phone_in_message
             collected["active_contact_phone"] = phone_in_message
-            reassign_troubleshooting_contact(
+            return reassign_troubleshooting_contact(
                 phone,
                 phone_in_message,
                 collected,
                 chat_hist,
-                "COLLECTING_DETAILS",
+                "SELF_REPAIR_IGNITION",
                 current_intent,
                 standing_hours,
                 "Update: aapne alternate contact share kar diya hai. Hum troubleshooting naye contact ke saath continue kar rahe hain.",
+                explicit_prompt="Kripya ek baar ignition ON hai ya nahi check kijiye."
             )
-            return {"status": "other_contact_handoff_completed"}
 
         if contact_choice == "self":
             collected["contact_mode"] = "self"
             collected["active_contact_phone"] = phone
-            reply_msg = f"{prefix_reply}Theek hai, hum aapke saath hi troubleshooting continue karte hain."
-            chat_hist.append({"role": "bot", "text": reply_msg})
-            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
-            send_whatsapp_meta(phone, reply_msg)
-            return {"status": "self_handoff_completed"}
+            return start_self_repair_flow(phone, collected, chat_hist, current_intent, standing_hours)
 
         if contact_choice == "driver":
             collected["contact_mode"] = "driver"
@@ -575,17 +693,17 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
             collected["contact_mode"] = "driver"
             collected["active_contact_phone"] = target_phone
             collected["contact_person"] = collected.get("driver_name") or collected.get("contact_person") or "Driver"
-            reassign_troubleshooting_contact(
+            return reassign_troubleshooting_contact(
                 phone,
                 target_phone,
                 collected,
                 chat_hist,
-                "COLLECTING_DETAILS",
+                "SELF_REPAIR_IGNITION",
                 current_intent,
                 standing_hours,
                 "Update: customer ne driver confirmation de di hai. Hum troubleshooting driver ke saath continue kar rahe hain.",
+                explicit_prompt="Kripya ek baar ignition ON hai ya nahi check kijiye."
             )
-            return {"status": "driver_handoff_completed"}
 
         if driver_phone:
             collected["contact_mode"] = "driver"
@@ -593,17 +711,17 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
             if new_contact_name:
                 collected["driver_name"] = new_contact_name
             collected["contact_person"] = new_contact_name or collected.get("driver_name") or "Driver"
-            reassign_troubleshooting_contact(
+            return reassign_troubleshooting_contact(
                 phone,
                 driver_phone,
                 collected,
                 chat_hist,
-                "COLLECTING_DETAILS",
+                "SELF_REPAIR_IGNITION",
                 current_intent,
                 standing_hours,
                 "Update: driver details update ho gayi hain. Hum troubleshooting naye driver ke saath continue kar rahe hain.",
+                explicit_prompt="Kripya ek baar ignition ON hai ya nahi check kijiye."
             )
-            return {"status": "driver_handoff_updated"}
 
         reply_msg = f"{prefix_reply}Please driver ko confirm karein ya naya naam/number bhej dein."
         chat_hist.append({"role": "bot", "text": reply_msg})
@@ -626,17 +744,88 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
         collected["driver_phone"] = new_phone
         collected["contact_mode"] = "other"
         collected["active_contact_phone"] = new_phone
-        reassign_troubleshooting_contact(
+        return reassign_troubleshooting_contact(
             phone,
             new_phone,
             collected,
             chat_hist,
-            "COLLECTING_DETAILS",
+            "SELF_REPAIR_IGNITION",
             current_intent,
             standing_hours,
             "Update: alternate contact add ho gaya hai. Ab troubleshooting naye contact ke saath continue ho rahi hai.",
+            explicit_prompt="Kripya ek baar ignition ON hai ya nahi check kijiye."
         )
-        return {"status": "other_contact_handoff_completed"}
+
+    if current_state == "SELF_REPAIR_IGNITION":
+        chat_hist.append({"role": "user", "text": message})
+        return perform_self_repair_check_and_continue(
+            phone,
+            collected,
+            chat_hist,
+            "SELF_REPAIR_LED",
+            "GPS device ki LED jal rahi hai, blink kar rahi hai ya band hai?"
+        )
+
+    if current_state == "SELF_REPAIR_LED":
+        chat_hist.append({"role": "user", "text": message})
+        return perform_self_repair_check_and_continue(
+            phone,
+            collected,
+            chat_hist,
+            "SELF_REPAIR_SIM",
+            "Kya GPS device ki SIM active hai aur usme data pack hai?"
+        )
+
+    if current_state == "SELF_REPAIR_SIM":
+        chat_hist.append({"role": "user", "text": message})
+        if is_pata_nahi_response(message):
+            info_msg = "SIM ko kisi mobile me laga kar internet check kar lijiye."
+            chat_hist.append({"role": "bot", "text": info_msg})
+            send_whatsapp_meta(phone, info_msg)
+        return perform_self_repair_check_and_continue(
+            phone,
+            collected,
+            chat_hist,
+            "SELF_REPAIR_WIRING",
+            "GPS device ki wiring aur power connection ek baar check kar lijiye."
+        )
+
+    if current_state == "SELF_REPAIR_WIRING":
+        chat_hist.append({"role": "user", "text": message})
+        return perform_self_repair_check_and_continue(
+            phone,
+            collected,
+            chat_hist,
+            "SELF_REPAIR_OPEN_SKY",
+            "Vehicle ko open area me le jaakar 5–10 minute wait kijiye."
+        )
+
+    if current_state == "SELF_REPAIR_OPEN_SKY":
+        chat_hist.append({"role": "user", "text": message})
+        return perform_self_repair_check_and_continue(
+            phone,
+            collected,
+            chat_hist,
+            "SELF_REPAIR_FINAL_VERIFICATION",
+            "Kripya 2–3 minute wait kijiye. Hum backend se GPS dobara check kar rahe hain."
+        )
+
+    if current_state == "SELF_REPAIR_FINAL_VERIFICATION":
+        chat_hist.append({"role": "user", "text": message})
+        active_phone = collected.get("active_contact_phone") or phone
+        snapshot = get_backend_gps_snapshot(active_phone)
+        if snapshot and is_gps_online(snapshot):
+            return close_self_repair_case(phone, collected, chat_hist)
+
+        collected["intent"] = collected.get("intent") or "VEHICLE_RUNNING"
+        reply_msg = (
+            "Hum ab service booking flow start kar rahe hain.\n"
+            "Kripya apni vehicle ki current location batayein."
+        )
+        chat_hist.append({"role": "bot", "text": reply_msg})
+        database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+        send_whatsapp_meta(phone, reply_msg)
+        return {"status": "service_booking_started"}
 
     # ==========================================================================
     # WORKFLOW BRANCH ROUTING
