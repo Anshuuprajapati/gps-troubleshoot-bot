@@ -263,18 +263,68 @@ def extract_phone_number(text: str) -> Optional[str]:
 
 
 def get_backend_gps_snapshot(phone_number: str) -> Optional[dict]:
+    """
+    Always performs a FRESH read of GPS data for the given phone number.
+
+    Priority:
+      1. Live read from database.get_user() — guarantees up-to-date gpsStatus
+         so that a gpsStatus flip to 1 during self-repair steps is detected
+         immediately at every step check.
+      2. HTTP call to the backend /api/test/get-gps-data endpoint (fallback
+         when the user record does not exist, e.g. flow started via direct
+         trigger-outage without a saved user).
+      3. Local session data (last-resort fallback when the API is unreachable).
+
+    NOTE: The user record is intentionally re-fetched on every call rather than
+    cached, because the GPS status can change between self-repair steps and we
+    must close the case the moment gpsStatus becomes 1.
+    """
+    # ── Priority 1: Fresh read from users table ────────────────────────────────
+    user = database.get_user(phone_number)
+    if user:
+        gps_data = user.get("gps_data") or {}
+        if isinstance(gps_data, dict):
+            logger.info(
+                "[GPS_SNAPSHOT] Fresh user record read for %s | gpsStatus=%s",
+                phone_number,
+                gps_data.get("gpsStatus"),
+            )
+            gps_payload = {
+                "phone_number": phone_number,
+                "vehicle_no": user.get("vehicle_no"),
+                "last_location": user.get("last_location"),
+                "timestamp": user.get("timestamp"),
+                "gps_data": gps_data,
+            }
+            gps_snapshot = {
+                "phone_number": phone_number,
+                "vehicle_no": user.get("vehicle_no"),
+                "last_location": user.get("last_location"),
+                "timestamp": user.get("timestamp"),
+                "gps_data": gps_data,
+                "user": user,
+            }
+            return {"status": "found", "payload": gps_payload, "gps_snapshot": gps_snapshot}
+
+    # ── Priority 2: HTTP fallback to backend GPS snapshot API ─────────────────
     backend_url = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
     try:
-        resp = requests.get(f"{backend_url}/api/test/get-gps-data/{phone_number}", timeout=6)
+        resp = requests.get(
+            f"{backend_url}/api/test/get-gps-data/{phone_number}", timeout=6
+        )
         if resp.status_code == 200:
+            logger.info(
+                "[GPS_SNAPSHOT] Fetched from backend API for %s", phone_number
+            )
             return resp.json()
     except Exception as e:
-        logger.warning(f"Unable to call backend GPS snapshot API: {e}")
+        logger.warning(f"[GPS_SNAPSHOT] Backend API unreachable for {phone_number}: {e}")
 
-    # Fallback to local session data if API is not reachable
+    # ── Priority 3: Local session fallback ────────────────────────────────────
     session = database.get_session(phone_number)
     if not session:
         return None
+
     collected = session.get("collected_json", {})
     gps_data = collected.get("gps_data", {}) or {}
     fallback_keys = [
@@ -290,6 +340,12 @@ def get_backend_gps_snapshot(phone_number: str) -> Optional[dict]:
     for key in fallback_keys:
         if key not in gps_data and collected.get(key) is not None:
             gps_data[key] = collected.get(key)
+
+    logger.info(
+        "[GPS_SNAPSHOT] Using session fallback for %s | gpsStatus=%s",
+        phone_number,
+        gps_data.get("gpsStatus"),
+    )
 
     gps_payload = {
         "phone_number": phone_number,
@@ -325,11 +381,71 @@ def get_backend_gps_snapshot(phone_number: str) -> Optional[dict]:
 
 
 def is_gps_online(snapshot: dict) -> bool:
-    gps_data = snapshot.get("payload", {}).get("gps_data") or snapshot.get("gps_snapshot", {}).get("gps_data")
-    if not gps_data:
+    """Return True when the backend reports GPS is online.
+
+    Supports nested shapes like {'payload': {'gps_data': {'gpsStatus': 1}}},
+    direct user payloads like {'gps_data': {'gpsStatus': 1}}, and user records
+    returned from the CRUD API via {'user': {'gps_data': {'gpsStatus': 1}}}.
+    """
+    if not isinstance(snapshot, dict):
         return False
-    if gps_data.get("gpsStatus") == 1:
-        return True
+
+    def _coerce_status(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value == 1
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned in {"1", "true", "yes", "online", "y"}:
+                return True
+            if cleaned in {"0", "false", "no", "offline", "n"}:
+                return False
+        return None
+
+    candidates = []
+    candidates.append(snapshot.get("gpsStatus"))
+    candidates.append(snapshot.get("status"))
+
+    direct_gps_data = snapshot.get("gps_data")
+    if isinstance(direct_gps_data, dict):
+        candidates.append(direct_gps_data.get("gpsStatus"))
+        candidates.append(direct_gps_data.get("status"))
+
+    payload = snapshot.get("payload")
+    if isinstance(payload, dict):
+        candidates.append(payload.get("gpsStatus"))
+        candidates.append(payload.get("status"))
+        gps_data = payload.get("gps_data") or {}
+        if isinstance(gps_data, dict):
+            candidates.append(gps_data.get("gpsStatus"))
+            candidates.append(gps_data.get("status"))
+
+    gps_snapshot = snapshot.get("gps_snapshot")
+    if isinstance(gps_snapshot, dict):
+        candidates.append(gps_snapshot.get("gpsStatus"))
+        candidates.append(gps_snapshot.get("status"))
+        gps_data = gps_snapshot.get("gps_data") or {}
+        if isinstance(gps_data, dict):
+            candidates.append(gps_data.get("gpsStatus"))
+            candidates.append(gps_data.get("status"))
+
+    user_record = snapshot.get("user")
+    if isinstance(user_record, dict):
+        candidates.append(user_record.get("gpsStatus"))
+        candidates.append(user_record.get("status"))
+        gps_data = user_record.get("gps_data") or {}
+        if isinstance(gps_data, dict):
+            candidates.append(gps_data.get("gpsStatus"))
+            candidates.append(gps_data.get("status"))
+
+    for candidate in candidates:
+        parsed = _coerce_status(candidate)
+        if parsed is not None:
+            return parsed
+
     return False
 
 
@@ -342,7 +458,40 @@ def close_self_repair_case(phone: str, collected: dict, chat_hist: list) -> dict
     return {"status": "self_repair_case_closed", "message": "gps_online"}
 
 
+def check_self_repair_status(phone: str, collected: dict, chat_hist: list, context: str):
+    """
+    Perform a fresh GPS status check before every self-repair step.
+
+    Uses the active_contact_phone so that if the conversation was handed off
+    to a driver the correct user record is queried. Logs the check result so
+    it is easy to trace in production.
+    """
+    active_phone = collected.get("active_contact_phone") or phone
+    logger.info(
+        "[SELF_REPAIR_CHECK] Checking GPS status for %s (context: %s)",
+        active_phone,
+        context,
+    )
+    snapshot = get_backend_gps_snapshot(active_phone)
+    if snapshot and is_gps_online(snapshot):
+        original_phone = collected.get("original_customer_phone") or phone
+        logger.info(
+            "[SELF_REPAIR_CHECK] gpsStatus=1 detected for %s — closing case (context: %s)",
+            original_phone,
+            context,
+        )
+        return close_self_repair_case(original_phone, collected, chat_hist)
+    logger.info(
+        "[SELF_REPAIR_CHECK] GPS still offline for %s (context: %s)", active_phone, context
+    )
+    return None
+
+
 def prompt_self_repair_step(phone: str, collected: dict, chat_hist: list, state: str, prompt: str) -> dict:
+    closed = check_self_repair_status(phone, collected, chat_hist, f"prompt:{state}")
+    if closed is not None:
+        return closed
+
     chat_hist.append({"role": "bot", "text": prompt})
     database.save_session(phone, state, collected, chat_hist)
     send_whatsapp_meta(phone, prompt)
@@ -364,10 +513,15 @@ def advance_self_repair_to_next_step(phone: str, collected: dict, chat_hist: lis
 
 
 def perform_self_repair_check_and_continue(phone: str, collected: dict, chat_hist: list, next_state: str, next_prompt: str) -> dict:
-    active_phone = collected.get("active_contact_phone") or phone
-    snapshot = get_backend_gps_snapshot(active_phone)
-    if snapshot and is_gps_online(snapshot):
-        return close_self_repair_case(phone, collected, chat_hist)
+    """
+    Called after the user replies to a self-repair step.
+    1. Do a fresh GPS check — if online, close the case immediately.
+    2. Otherwise advance to the next step and send its prompt (which itself
+       does another GPS check before sending, via prompt_self_repair_step).
+    """
+    closed = check_self_repair_status(phone, collected, chat_hist, f"step:{next_state}")
+    if closed is not None:
+        return closed
     return advance_self_repair_to_next_step(phone, collected, chat_hist, next_state, next_prompt)
 
 
@@ -461,10 +615,8 @@ def reassign_troubleshooting_contact(
     if original_phone != target_phone and intro_message:
         send_whatsapp_meta(target_phone, intro_message)
     prompt = explicit_prompt or build_troubleshooting_prompt(current_intent, collected, standing_hours)
-    new_history.append({"role": "bot", "text": prompt})
-    database.save_session(target_phone, current_state, collected, new_history)
-    send_whatsapp_meta(target_phone, prompt)
-    return {"status": "self_repair_prompt_sent", "state": current_state}
+    # Use the centralized prompt helper so a backend/session GPS check happens before sending
+    return prompt_self_repair_step(target_phone, collected, new_history, current_state, prompt)
 
 
 # ==============================================================================
@@ -529,7 +681,7 @@ async def start_other_issue_flow(payload: dict):
             "contact_person": None,
             "is_in_workshop_currently": None,
             "wants_service_visit": None,
-            "scheduling_step": 0, 
+            "scheduling_step": 0,
             "ticket_id": None
         },
         chat_history=[{"role": "bot", "text": initial_alert_msg}]
@@ -554,6 +706,11 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
     current_state = session.get("current_state", "INITIAL_ALERT")
     collected = session.get("collected_json", {})
     chat_hist = session.get("chat_history", [])
+
+    if current_state.startswith("SELF_REPAIR_"):
+        closed = check_self_repair_status(phone, collected, chat_hist, f"reply:{current_state}")
+        if closed is not None:
+            return closed
 
     if current_state == "STATUS_ONLY":
         status_contact = collected.get("contact_person") or collected.get("driver_name") or "selected contact"
