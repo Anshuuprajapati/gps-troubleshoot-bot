@@ -62,6 +62,19 @@ def init_db():
             if col not in existing_ticket_cols:
                 cursor.execute(f"ALTER TABLE tickets ADD COLUMN {col} TEXT")
 
+        # ── Users table ────────────────────────────────────────────────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                phone_number  TEXT PRIMARY KEY,
+                vehicle_no    TEXT,
+                last_location TEXT,
+                timestamp     TEXT,
+                gps_data      TEXT,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+
         conn.commit()
     print("[DB] Database initialized successfully.")
 
@@ -248,3 +261,94 @@ def update_ticket_status(ticket_id: str, status: str):
             (status, now, ticket_id)
         )
         conn.commit()
+
+
+# ==========================================
+# USER OPERATIONS
+# ==========================================
+
+def save_user(data: dict):
+    """
+    Inserts or updates a user record (UPSERT).
+    On conflict with an existing phone_number, updates vehicle_no, last_location,
+    timestamp, gps_data, and updated_at.
+    """
+    now = datetime.utcnow().isoformat()
+    gps_data_json = json.dumps(data.get("gps_data") or {})
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO users (phone_number, vehicle_no, last_location, timestamp, gps_data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(phone_number) DO UPDATE SET
+                vehicle_no    = excluded.vehicle_no,
+                last_location = excluded.last_location,
+                timestamp     = excluded.timestamp,
+                gps_data      = excluded.gps_data,
+                updated_at    = excluded.updated_at
+        """, (
+            data.get("phone_number"),
+            data.get("vehicle_no"),
+            data.get("last_location"),
+            data.get("timestamp"),
+            gps_data_json,
+            now,
+            now
+        ))
+        conn.commit()
+    print(f"[DB] User {data.get('phone_number')} saved.")
+
+
+def get_user(phone_number: str) -> dict | None:
+    """
+    Retrieves a user by phone_number.
+    Returns a dict with deserialized gps_data, or None if not found.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT phone_number, vehicle_no, last_location, timestamp, gps_data FROM users WHERE phone_number = ?",
+            (phone_number,)
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "phone_number": row["phone_number"],
+        "vehicle_no": row["vehicle_no"],
+        "last_location": row["last_location"],
+        "timestamp": row["timestamp"],
+        "gps_data": json.loads(row["gps_data"]) if row["gps_data"] else {}
+    }
+
+
+def get_all_users() -> list:
+    """
+    Returns a list of all users with deserialized gps_data.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT phone_number, vehicle_no, last_location, timestamp, gps_data FROM users"
+        )
+        rows = cursor.fetchall()
+
+    return [
+        {
+            "phone_number": row["phone_number"],
+            "vehicle_no": row["vehicle_no"],
+            "last_location": row["last_location"],
+            "timestamp": row["timestamp"],
+            "gps_data": json.loads(row["gps_data"]) if row["gps_data"] else {}
+        }
+        for row in rows
+    ]
+
+
+def delete_user(phone_number: str):
+    """Deletes a user by phone_number."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM users WHERE phone_number = ?", (phone_number,))
+        conn.commit()
+    print(f"[DB] User {phone_number} deleted.")

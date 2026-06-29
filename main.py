@@ -482,3 +482,163 @@ async def get_session_for_testing(phone_number: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get session: {str(e)}"
         )
+
+
+# ==============================================================================
+# 7. USER CRUD APIs
+# ==============================================================================
+
+@app.post("/api/users")
+async def create_user(payload: OutageRequest):
+    """
+    Save a user record to the database.
+    Accepts the same OutageRequest payload used for outage triggering.
+    """
+    try:
+        data = {
+            "phone_number": payload.phone_number,
+            "vehicle_no": payload.vehicle_no,
+            "last_location": payload.last_location,
+            "timestamp": payload.timestamp,
+            "gps_data": payload.gps_data.model_dump() if payload.gps_data else {}
+        }
+        database.save_user(data)
+        return {"status": "success", "message": "User saved successfully"}
+    except Exception as e:
+        logger.error(f"Error saving user: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save user: {str(e)}"
+        )
+
+
+@app.get("/api/users")
+async def list_users():
+    """
+    Return all users stored in the database.
+    """
+    try:
+        users = database.get_all_users()
+        return {"status": "success", "users": users}
+    except Exception as e:
+        logger.error(f"Error fetching users: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch users: {str(e)}"
+        )
+
+
+@app.get("/api/users/{phone_number}")
+async def get_user(phone_number: str):
+    """
+    Return a single user by phone number.
+    Returns 404 if not found.
+    """
+    try:
+        user = database.get_user(phone_number)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with phone number {phone_number} not found"
+            )
+        return {"status": "success", "user": user}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user {phone_number}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch user: {str(e)}"
+        )
+
+
+@app.put("/api/users/{phone_number}")
+async def update_user(phone_number: str, payload: OutageRequest):
+    """
+    Update an existing user record.
+    Uses save_user() which performs an UPSERT.
+    """
+    try:
+        data = {
+            "phone_number": phone_number,
+            "vehicle_no": payload.vehicle_no,
+            "last_location": payload.last_location,
+            "timestamp": payload.timestamp,
+            "gps_data": payload.gps_data.model_dump() if payload.gps_data else {}
+        }
+        database.save_user(data)
+        return {"status": "success", "message": "User updated successfully"}
+    except Exception as e:
+        logger.error(f"Error updating user {phone_number}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update user: {str(e)}"
+        )
+
+
+@app.delete("/api/users/{phone_number}")
+async def remove_user(phone_number: str):
+    """
+    Delete a user by phone number.
+    """
+    try:
+        user = database.get_user(phone_number)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with phone number {phone_number} not found"
+            )
+        database.delete_user(phone_number)
+        return {"status": "success", "message": f"User {phone_number} deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user {phone_number}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete user: {str(e)}"
+        )
+
+
+@app.post("/api/users/{phone_number}/trigger")
+async def trigger_outage_for_user(phone_number: str):
+    """
+    Load a stored user by phone number and trigger the outage flow automatically.
+
+    Flow:
+        Load user → Analyze root cause → Create session → Send initial WhatsApp message → Start conversation
+    """
+    try:
+        user = database.get_user(phone_number)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with phone number {phone_number} not found"
+            )
+
+        # Convert stored gps_data dict back into GpsData model
+        gps_data_dict = user.get("gps_data") or {}
+        gps_data_model = GpsData(**gps_data_dict) if gps_data_dict else None
+
+        # Build OutageRequest from stored user data
+        outage_payload = OutageRequest(
+            phone_number=user["phone_number"],
+            vehicle_no=user["vehicle_no"] or "",
+            last_location=user["last_location"] or "",
+            timestamp=user["timestamp"] or "",
+            gps_data=gps_data_model
+        )
+
+        # Reuse existing trigger_outage logic — no duplication
+        logger.info(f"Triggering outage flow for stored user: {phone_number}")
+        result = await trigger_outage(outage_payload)
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error triggering outage for user {phone_number}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to trigger outage for user: {str(e)}"
+        )
