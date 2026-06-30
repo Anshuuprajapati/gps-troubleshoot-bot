@@ -229,30 +229,19 @@ Your job is to analyze the conversation history and the latest message to determ
    - `service_city_confirmed`: true if user agrees, false if they reject, null if not asked yet
    - `service_city`: The actual city where they want service (only if suggestion rejected)
 
-3. **Scheduling Loop Tracking**:
+3. **Contact Person Allocation**:
+   - If the user responds with general agreement ("haan", "yes", "ok", "main khud") to checking it themselves, understand this as choosing "self".
+
+4. **Scheduling Loop Tracking**:
    - If a slot suggestion is rejected, mark `slot_rejected: true`.
    - If they agree or supply a date themselves, capture it into `entities.service_date`.
    - `slot_rejected` must be false once they accept any date so the flow can advance.
-
-4. **GPS_REMOVED Rule**: Look for `wants_service_visit`.
 
 5. **Driver Verification (VEHICLE_RUNNING)**:
    - If the user agrees with the existing driver, set `contact_person` to the driver name,
      `driver_phone` to the existing driver phone, `contact_person_confirmed: true`.
    - If they provide a NEW name or phone, extract into `contact_person` and `driver_phone`,
      set `contact_person_confirmed: true`.
-
-6. **Date Alternative Selection**: When the user responds to the 3-option menu:
-   - Option "1" or "after 2 days" → set `entities.service_date` = "today+2"
-   - Option "2" or "after 4 days" → set `entities.service_date` = "today+4"
-   - Option "3" or explicit date  → extract into `entities.service_date`
-   Mark `slot_rejected: false` once they choose.
-
-7. **Side Questions**: If the user asks an off-topic question (e.g., asking about support hours,
-   other vehicle services, or any out-of-scope question) instead of answering your specific
-   progress question, provide a direct answer in `side_question_reply`. Do NOT clear or
-   overwrite any previously extracted entities. Do NOT change `slot_rejected` or any other
-   flow-control fields just because of a side question.
 
 ## RESPONSE SCHEMA (STRICT - Return ONLY valid JSON, no markdown):
 {
@@ -517,7 +506,8 @@ def is_negative_response(text: str) -> bool:
 
 def detect_contact_choice(text: str) -> Optional[str]:
     cleaned = text.strip().lower()
-    if re.search(r"\b(khud|self|main|hum|owner|mai|me)\b", cleaned):
+    # If the user says "yes", "haan", "haa", "ha", or "myself", map it to "self".
+    if re.search(r"\b(khud|self|main|hum|owner|mai|me|haan|haa|ha|yes|y|ok|okay|theek|thik)\b", cleaned):
         return "self"
     if re.search(r"\b(driver|driver se|driver ko|driver ka|unse)\b", cleaned):
         return "driver"
@@ -536,6 +526,31 @@ def is_pata_nahi_response(text: str) -> bool:
         r"\b(pata nahi|pata nahin|pata nhi|dont know|unknown|not sure)\b",
         text.strip().lower()
     ))
+
+
+def apply_service_city_confirmation(message: str, collected: dict, ext_entities: dict) -> Optional[dict]:
+    """Handle affirmative/negative replies to the service-city confirmation prompt."""
+    if collected.get("service_city_confirmed") is not None or collected.get("service_city"):
+        return None
+
+    cleaned = message.strip().lower()
+    if is_affirmative_response(cleaned):
+        service_city = (
+            ext_entities.get("service_city")
+            or collected.get("service_city")
+            or collected.get("destination_location")
+            or "Delhi"
+        )
+        collected["service_city_confirmed"] = True
+        collected["service_city"] = service_city
+        return {"confirmed": True, "service_city": service_city}
+
+    if is_negative_response(cleaned):
+        collected["service_city_confirmed"] = False
+        collected["service_city"] = None
+        return {"confirmed": False, "service_city": None}
+
+    return None
 
 
 def build_troubleshooting_prompt(current_intent: Optional[str], collected: dict, standing_hours: float) -> str:
@@ -919,17 +934,19 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
     if current_state == "INITIAL_ALERT" and current_intent in {
         "VEHICLE_RUNNING", "GPS_DAMAGED", "VEHICLE_STANDING", "GPS_REMOVED"
     }:
+        # Switched to single-escaped native newlines for uniform Meta delivery
         reply_msg = (
             f"{prefix_reply}Kya aap khud GPS issue check karenge, "
             f"ya hum driver ya kisi aur contact person se baat karein?"
-        )
+        ).replace(r"\n", "\n")
+        
         chat_hist.append({"role": "bot", "text": reply_msg})
         collected["troubleshooting_contact_requested"] = True
         database.save_session(phone, "AWAITING_TROUBLESHOOTING_CONTACT", collected, chat_hist)
         send_whatsapp_meta(phone, reply_msg)
         return {"status": "awaiting_troubleshooting_contact"}
 
-    # ── AWAITING_TROUBLESHOOTING_CONTACT ──────────────────────────────────────
+    # ── AWAITING_TROUBLESHOOTING_CONTACT STEP FIX
     if current_state == "AWAITING_TROUBLESHOOTING_CONTACT":
         contact_choice = detect_contact_choice(message)
         phone_in_message = extract_phone_number(message)
@@ -943,15 +960,22 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
             collected["active_contact_phone"] = phone_in_message
             return reassign_troubleshooting_contact(
                 phone, phone_in_message, collected, chat_hist,
-                "SELF_REPAIR_IGNITION", current_intent, standing_hours,
-                "Update: aapne alternate contact share kar diya hai. Hum troubleshooting naye contact ke saath continue kar rahe hain.",
-                explicit_prompt="Kripya ek baar ignition ON hai ya nahi check kijiye.",
+                "COLLECTING_DETAILS", current_intent, standing_hours
             )
 
         if contact_choice == "self":
             collected["contact_mode"] = "self"
             collected["active_contact_phone"] = phone
-            return start_self_repair_flow(phone, collected, chat_hist, current_intent, standing_hours)
+            
+            if not collected.get("intent"):
+                collected["intent"] = "VEHICLE_RUNNING"
+                
+            prompt = build_troubleshooting_prompt(collected["intent"], collected, standing_hours).replace(r"\n", "\n")
+            chat_hist.append({"role": "bot", "text": prompt})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, prompt)
+            return {"status": "service_booking_started", "state": "COLLECTING_DETAILS"}
+        
 
         if contact_choice == "driver":
             collected["contact_mode"] = "driver"
@@ -1218,12 +1242,24 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
 
         # Step C: Suggest service city
         if collected.get("service_city_confirmed") is None and not collected.get("service_city"):
-            suggested_city = collected.get("destination_location") or "Delhi"
-            reply_msg = f"{prefix_reply}Kya hum {suggested_city} mein service book kar dein?"
-            chat_hist.append({"role": "bot", "text": reply_msg})
-            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
-            send_whatsapp_meta(phone, reply_msg)
-            return {"status": "asking_service_city_preference"}
+            confirmation = apply_service_city_confirmation(message, collected, ext_entities)
+            if confirmation is not None:
+                if confirmation["confirmed"]:
+                    # Continue to the next step directly without asking again.
+                    pass
+                else:
+                    reply_msg = f"{prefix_reply}Kaun se city mein service chahiye? (Preferred city batayein)"
+                    chat_hist.append({"role": "bot", "text": reply_msg})
+                    database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                    send_whatsapp_meta(phone, reply_msg)
+                    return {"status": "collecting_preferred_service_city"}
+            else:
+                suggested_city = collected.get("destination_location") or "Delhi"
+                reply_msg = f"{prefix_reply}Kya hum {suggested_city} mein service book kar dein?"
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
+                return {"status": "asking_service_city_preference"}
 
         # Step D: If city rejected, ask preferred city
         if collected.get("service_city_confirmed") is False and not collected.get("service_city"):
