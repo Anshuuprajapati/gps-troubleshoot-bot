@@ -103,6 +103,14 @@ def _resolve_service_date(raw: str) -> Optional[str]:
     if m:
         return (date.today() + timedelta(days=int(m.group(1)))).strftime("%d-%m-%Y")
 
+    # ── "aaj" / "ajj" / "today"
+    if re.search(r"\b(aaj|ajj|today|todays)\b", raw, re.I):
+        return date.today().strftime("%d-%m-%Y")
+
+    # ── relative: "today+N" produced by LLM
+    if m:
+        return (date.today() + timedelta(days=int(m.group(1)))).strftime("%d-%m-%Y")
+
     # ── "N days" / "N din baad" / "after N days"
     m = re.search(r"(\d+)\s*(din\s*baad|days?\s*baad|days?\s*later|days?)", raw, re.I)
     if m:
@@ -528,6 +536,107 @@ def is_pata_nahi_response(text: str) -> bool:
     ))
 
 
+def build_driver_confirmation_prompt(collected: dict) -> str:
+    d_name = collected.get("driver_name") or "Not Available"
+    d_phone = collected.get("driver_phone") or "Not Available"
+    return (
+        "Humare paas driver ki details available hain:\n\n"
+        f"👤 Driver Name: {d_name}\n"
+        f"📞 Driver Contact: {d_phone}\n\n"
+        "Kya aap in details ko confirm karte hain, ya driver ka naya naam/number share karenge?"
+    )
+
+
+def get_service_date_prompt(now: Optional[datetime] = None) -> str:
+    current_time = now or datetime.now()
+    if current_time.hour < 19:
+        return "Kya aaj service book kar dein?"
+    return "Kya kal service book kar dein?"
+
+
+def _is_ambiguous_numeric_date(raw: Any) -> bool:
+    if raw is None:
+        return False
+    cleaned = str(raw).strip().lower()
+    return bool(re.fullmatch(r"\d{1,2}", cleaned))
+
+
+def _is_ambiguous_numeric_date(raw: Any) -> bool:
+    if raw is None:
+        return False
+    cleaned = str(raw).strip().lower()
+    return bool(re.fullmatch(r"\d{1,2}", cleaned))
+
+
+def is_option_selection(message: str) -> bool:
+    return bool(re.fullmatch(r"[1-3]", message.strip()))
+
+
+def resolve_affirmative_service_date(message: str, collected: dict, now: Optional[datetime] = None) -> Optional[str]:
+    if not is_affirmative_response(message):
+        return None
+    if collected.get("awaiting_date_options"):
+        return None
+    current_time = now or datetime.now()
+    if current_time.hour < 19:
+        return current_time.date().strftime("%d-%m-%Y")
+    return (current_time.date() + timedelta(days=1)).strftime("%d-%m-%Y")
+
+
+def is_option_selection(message: str) -> bool:
+    return bool(re.fullmatch(r"[1-3]", message.strip()))
+
+
+def apply_driver_confirmation(message: str, collected: dict, ext_entities: dict) -> Optional[dict]:
+    cleaned = message.strip().lower()
+    if is_affirmative_response(cleaned):
+        collected["driver_contact_confirmed"] = True
+        collected["contact_person"] = collected.get("driver_name") or collected.get("contact_person") or "Driver"
+        if not collected.get("driver_phone"):
+            collected["driver_phone"] = collected.get("driver_phone")
+        return {"confirmed": True, "alternate_contact": False}
+
+    if is_negative_response(cleaned):
+        collected["driver_contact_confirmed"] = False
+        collected["awaiting_alternate_contact"] = True
+        return {"confirmed": False, "alternate_contact": False}
+
+    new_phone = extract_phone_number(message)
+    new_name = ext_entities.get("contact_person") or ext_entities.get("driver_name")
+    if new_phone or new_name:
+        collected["driver_contact_confirmed"] = True
+        collected["awaiting_alternate_contact"] = False
+        if new_name:
+            collected["contact_person"] = new_name
+            collected["driver_name"] = new_name
+        if new_phone:
+            collected["driver_phone"] = new_phone
+        return {"confirmed": True, "alternate_contact": True}
+
+    return None
+
+
+def apply_service_time_window(message: str, collected: dict) -> Optional[dict]:
+    cleaned = message.strip()
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    if is_affirmative_response(lowered) or is_negative_response(lowered):
+        return None
+
+    has_time_tokens = bool(
+        re.search(r"\b\d{1,2}(?::\d{2})?\s*(am|pm|a\.m\.|p\.m\.|baje)\b", lowered)
+        or re.search(r"\b\d{1,2}\s*(se|tak|to)\s*\d{1,2}\b", lowered)
+        or re.search(r"\b\d{1,2}:\d{2}\b", lowered)
+        or re.search(r"\b(shaam|subah|dopahar|raat)\b", lowered)
+    )
+    if has_time_tokens:
+        collected["service_time_window"] = cleaned
+        return {"service_time_window": cleaned}
+    return None
+
+
 def apply_service_city_confirmation(message: str, collected: dict, ext_entities: dict) -> Optional[dict]:
     """Handle affirmative/negative replies to the service-city confirmation prompt."""
     if collected.get("service_city_confirmed") is not None or collected.get("service_city"):
@@ -569,16 +678,18 @@ def build_troubleshooting_prompt(current_intent: Optional[str], collected: dict,
         if collected.get("service_city_confirmed") is False and not collected.get("service_city"):
             return "Kaun se city mein service chahiye? (Preferred city batayein)"
         if not collected.get("service_date"):
-            return "Kya kal service book kar dein?"
+            return get_service_date_prompt()
+        if not collected.get("service_time_window"):
+            return "Kitne baje se kitne baje tak vehicle service ke liye available hogi?"
         if not collected.get("contact_person"):
             d_name = collected.get("driver_name")
             d_phone = collected.get("driver_phone")
             if d_name or d_phone:
                 return (
-                    f"Humare paas driver ki details available hain:\n\n"
-                    f"👤 *Driver Name:* {d_name or 'Not Available'}\n"
-                    f"📞 *Driver Contact:* {d_phone or 'Not Available'}\n\n"
-                    "Kya hum unse hi coordinate karein?"
+                    "Humare paas driver ki details available hain:\n\n"
+                    f"👤 Driver Name: {d_name or 'Not Available'}\n"
+                    f"📞 Driver Contact: {d_phone or 'Not Available'}\n\n"
+                    "Kya aap in details ko confirm karte hain, ya driver ka naya naam/number share karenge?"
                 )
             return "Service coordination ke liye contact person ka naam aur mobile number kya hai?"
         return "Kripya apni next update share kijiye."
@@ -688,6 +799,7 @@ async def create_service_ticket_flow(phone: str, collected: dict, chat_hist: lis
             "destination_location": collected.get("destination_location"),
             "service_city": service_city,
             "service_date": service_date,
+            "service_time_window": collected.get("service_time_window"),
             "contact_person": contact_person,
             "driver_phone": driver_phone,
             "driver_name": collected.get("driver_name"),
@@ -706,7 +818,9 @@ async def create_service_ticket_flow(phone: str, collected: dict, chat_hist: lis
             f"• *Destination:* {collected.get('destination_location')}\n"
             f"• *Service City:* {service_city}\n"
             f"• *Service Date:* {service_date}\n"
-            f"• *Contact Person:* {contact_person}\n\n"
+            f"• *Service Time Window:* {collected.get('service_time_window') or 'Not Provided'}\n"
+            f"• *Contact Person:* {contact_person}\n"
+            f"• *Contact Number:* {driver_phone}\n\n"
             f"Hamare engineer aapke contact person se coordinate karenge service ke liye. Dhanyavaad!"
         )
 
@@ -749,9 +863,6 @@ async def start_other_issue_flow(payload: dict):
         f"📍 Last Known Location: {last_location}\n"
         f"🕐 Last Update: {timestamp or gpstime}\n\n"
         f"Kripya batayein ki aapki vehicle ki current status kya hai:\n\n"
-        f"1️⃣ Workshop / Service Center\n"
-        f"2️⃣ Accident\n"
-        f"3️⃣ Vehicle Running but GPS Not Updating\n\n"
     )
 
     database.save_session(
@@ -781,6 +892,9 @@ async def start_other_issue_flow(payload: dict):
             "next_trip_location": None,
             "driver_phone": gps_data.get("driver_phone"),
             "driver_name": gps_data.get("driver_name"),
+            "driver_contact_confirmed": None,
+            "awaiting_alternate_contact": False,
+            "service_time_window": None,
             "initial_alert_msg": initial_alert_msg,
             "original_customer_phone": phone_number,
             "active_contact_phone": phone_number,
@@ -886,8 +1000,9 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
             collected["service_date"] = resolved
             collected["awaiting_date_options"] = False
             brain["slot_rejected"] = False
-        # If user said "3" or unclear, keep awaiting — don't set service_date yet
-        # But if brain gave us a date anyway, try that
+        elif is_option_selection(message):
+            # explicit menu selection should keep awaiting until we confirm the date
+            collected["awaiting_date_options"] = True
         elif raw_service_date:
             direct = _resolve_service_date(raw_service_date)
             if direct and re.match(r"\d{2}-\d{2}-\d{4}", direct):
@@ -895,14 +1010,41 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
                 collected["awaiting_date_options"] = False
                 brain["slot_rejected"] = False
     elif raw_service_date:
-        # Initial "kal" / "tomorrow" acceptance or any free-form date
-        collected["service_date"] = _resolve_service_date(raw_service_date)
-        brain["slot_rejected"] = False
+        if is_affirmative_response(message) and _is_ambiguous_numeric_date(raw_service_date):
+            collected["service_date"] = resolve_affirmative_service_date(message, collected)
+            brain["slot_rejected"] = False
+        elif is_option_selection(message):
+            mapped = _map_option_to_days(message, raw_service_date)
+            if mapped:
+                collected["service_date"] = mapped
+                collected["awaiting_date_options"] = False
+                brain["slot_rejected"] = False
+            else:
+                collected["service_date"] = _resolve_service_date(raw_service_date)
+                brain["slot_rejected"] = False
+        else:
+            # Initial "kal" / "tomorrow" acceptance or any free-form date
+            collected["service_date"] = _resolve_service_date(raw_service_date)
+            brain["slot_rejected"] = False
 
     if ext_entities.get("resume_date"):
         collected["resume_date"] = _resolve_service_date(ext_entities["resume_date"])
     if ext_entities.get("next_trip_date"):
         collected["next_trip_date"] = _resolve_service_date(ext_entities["next_trip_date"])
+
+    if not collected.get("service_date") and not raw_service_date:
+        if is_option_selection(message):
+            resolved_from_message = _map_option_to_days(message, raw_service_date)
+        else:
+            resolved_from_message = _resolve_service_date(message)
+        if resolved_from_message and re.match(r"\d{2}-\d{2}-\d{4}", resolved_from_message):
+            collected["service_date"] = resolved_from_message
+            brain["slot_rejected"] = False
+        else:
+            affirmative_date = resolve_affirmative_service_date(message, collected)
+            if affirmative_date:
+                collected["service_date"] = affirmative_date
+                brain["slot_rejected"] = False
 
     if is_phone_refusal_response(message):
         collected["driver_phone"] = "NOT_PROVIDED"
@@ -934,17 +1076,45 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
     if current_state == "INITIAL_ALERT" and current_intent in {
         "VEHICLE_RUNNING", "GPS_DAMAGED", "VEHICLE_STANDING", "GPS_REMOVED"
     }:
-        # Switched to single-escaped native newlines for uniform Meta delivery
-        reply_msg = (
-            f"{prefix_reply}Kya aap khud GPS issue check karenge, "
-            f"ya hum driver ya kisi aur contact person se baat karein?"
-        ).replace(r"\n", "\n")
-        
+        contact_choice = detect_contact_choice(message)
+        if contact_choice == "self":
+            collected["contact_mode"] = "self"
+            collected["active_contact_phone"] = phone
+            reply_msg = f"{prefix_reply}Samjha gaya. Hum aapke saath direct troubleshooting continue karenge. Aapki gaadi abhi kis location par hai?"
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "service_booking_started", "state": "COLLECTING_DETAILS"}
+
+        if contact_choice == "driver":
+            collected["contact_mode"] = "driver"
+            if collected.get("driver_name") or collected.get("driver_phone"):
+                reply_msg = f"{prefix_reply}{build_driver_confirmation_prompt(collected)}"
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
+                return {"status": "verifying_existing_driver"}
+
+        if contact_choice == "other":
+            collected["contact_mode"] = "other"
+            reply_msg = f"{prefix_reply}Theek hai. Kripya contact person's name (optional) aur mobile number bhejiye."
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "collecting_contact_person"}
+
+        if current_intent == "VEHICLE_RUNNING":
+            reply_msg = f"{prefix_reply}Aapki gaadi abhi kis location par hai? (Current location batayein)"
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "collecting_current_location"}
+
+        reply_msg = f"{prefix_reply}Kripya vehicle ki sthiti short me batayein."
         chat_hist.append({"role": "bot", "text": reply_msg})
-        collected["troubleshooting_contact_requested"] = True
-        database.save_session(phone, "AWAITING_TROUBLESHOOTING_CONTACT", collected, chat_hist)
+        database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
         send_whatsapp_meta(phone, reply_msg)
-        return {"status": "awaiting_troubleshooting_contact"}
+        return {"status": "collecting_details"}
 
     # ── AWAITING_TROUBLESHOOTING_CONTACT STEP FIX
     if current_state == "AWAITING_TROUBLESHOOTING_CONTACT":
@@ -1279,7 +1449,7 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
                 brain["slot_rejected"] = False
 
             if step == 0:
-                reply_msg = f"{prefix_reply}Kya kal service book kar dein?"
+                reply_msg = f"{prefix_reply}{get_service_date_prompt()}"
                 chat_hist.append({"role": "bot", "text": reply_msg})
                 database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
                 send_whatsapp_meta(phone, reply_msg)
@@ -1299,78 +1469,65 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
                 send_whatsapp_meta(phone, reply_msg)
                 return {"status": "negotiating_alternative_service_date"}
 
-        # Step F: Contact person / driver verification
-        if not collected.get("contact_person"):
-            d_name = collected.get("driver_name")
-            d_phone = collected.get("driver_phone")
-
-            # FIX S8/S9: handle "verifying_driver" replies
-            if collected.get("verifying_driver"):
+        # Step F: Driver confirmation
+        if not collected.get("driver_contact_confirmed") and (collected.get("driver_name") or collected.get("driver_phone")):
+            if collected.get("awaiting_alternate_contact"):
                 new_phone = extract_phone_number(message)
                 new_name = ext_entities.get("contact_person") or ext_entities.get("driver_name")
-
-                if is_affirmative_response(message) and not new_phone and not new_name:
-                    # User confirmed existing driver
-                    collected["contact_person"] = d_name or "Driver"
-                    collected["driver_phone"] = d_phone
-                    collected["verifying_driver"] = False
-                    # Save before falling through to ticket creation
-                    database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
-                elif new_phone or new_name:
-                    # User provided new contact details
+                if new_phone or new_name:
+                    collected["awaiting_alternate_contact"] = False
+                    collected["driver_contact_confirmed"] = True
                     if new_name:
                         collected["contact_person"] = new_name
                         collected["driver_name"] = new_name
-                    else:
-                        # Only phone given — keep existing name or "Driver"
-                        collected["contact_person"] = d_name or "Driver"
                     if new_phone:
                         collected["driver_phone"] = new_phone
-                    collected["verifying_driver"] = False
-                    # FIX S8/S9: Save updated contact details immediately
-                    database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
-                else:
-                    # Unclear response — re-ask
-                    reply_msg = (
-                        f"{prefix_reply}Humare paas driver ki details available hain:\n\n"
-                        f"👤 *Driver Name:* {d_name or 'Not Available'}\n"
-                        f"📞 *Driver Contact:* {d_phone or 'Not Available'}\n\n"
-                        "Kya hum unse hi coordinate karein? (Haan batayein ya unka alternative number/naam share karein)"
-                    )
+                    reply_msg = f"{prefix_reply}Kitne baje se kitne baje tak vehicle available hogi?"
                     chat_hist.append({"role": "bot", "text": reply_msg})
                     database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
                     send_whatsapp_meta(phone, reply_msg)
-                    return {"status": "verifying_existing_driver"}
+                    return {"status": "asking_service_time_window"}
 
-            elif d_name or d_phone:
-                # First time asking — show driver details for confirmation
-                reply_msg = (
-                    f"{prefix_reply}Humare paas driver ki details available hain:\n\n"
-                    f"👤 *Driver Name:* {d_name or 'Not Available'}\n"
-                    f"📞 *Driver Contact:* {d_phone or 'Not Available'}\n\n"
-                    "Kya hum unse hi coordinate karein? (Haan batayein ya unka alternative number/naam share karein)"
-                )
+                reply_msg = f"{prefix_reply}Kripya alternate contact person ka naam aur mobile number bhejiye."
                 chat_hist.append({"role": "bot", "text": reply_msg})
-                collected["verifying_driver"] = True
                 database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
                 send_whatsapp_meta(phone, reply_msg)
-                return {"status": "verifying_existing_driver"}
+                return {"status": "collecting_alternate_contact"}
 
+            confirmation = apply_driver_confirmation(message, collected, ext_entities)
+            if confirmation is not None:
+                if confirmation.get("confirmed"):
+                    reply_msg = f"{prefix_reply}Kitne baje se kitne baje tak vehicle available hogi?"
+                    chat_hist.append({"role": "bot", "text": reply_msg})
+                    database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                    send_whatsapp_meta(phone, reply_msg)
+                    return {"status": "asking_service_time_window"}
+
+                reply_msg = f"{prefix_reply}Theek hai. Kripya alternate contact person ka naam aur mobile number bhejiye."
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
+                return {"status": "collecting_alternate_contact"}
+
+            reply_msg = f"{prefix_reply}{build_driver_confirmation_prompt(collected)}"
+            chat_hist.append({"role": "bot", "text": reply_msg})
+            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+            send_whatsapp_meta(phone, reply_msg)
+            return {"status": "verifying_existing_driver"}
+
+        if not collected.get("service_time_window"):
+            time_window = apply_service_time_window(message, collected)
+            if time_window is not None:
+                reply_msg = f"{prefix_reply}Shukriya. Hum service slot ko note kar rahe hain."
+                chat_hist.append({"role": "bot", "text": reply_msg})
+                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
+                send_whatsapp_meta(phone, reply_msg)
             else:
-                # No driver details — ask directly
-                reply_msg = f"{prefix_reply}Service coordination ke liye contact person ka naam aur mobile number kya hai?"
+                reply_msg = f"{prefix_reply}Kitne baje se kitne baje tak vehicle service ke liye available hogi? (Jaise 10:00 se 14:00, 3 baje se 5 baje tak, ya koi aur format)"
                 chat_hist.append({"role": "bot", "text": reply_msg})
                 database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
                 send_whatsapp_meta(phone, reply_msg)
-                return {"status": "collecting_contact_person"}
-
-            # If contact_person still not set, don't proceed to ticket yet
-            if not collected.get("contact_person"):
-                reply_msg = f"{prefix_reply}Service coordination ke liye contact person ka naam aur mobile number kya hai?"
-                chat_hist.append({"role": "bot", "text": reply_msg})
-                database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
-                send_whatsapp_meta(phone, reply_msg)
-                return {"status": "collecting_contact_person"}
+                return {"status": "asking_service_time_window"}
 
         # All details collected — create ticket
         return await create_service_ticket_flow(phone, collected, chat_hist)
