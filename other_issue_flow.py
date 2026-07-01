@@ -98,6 +98,17 @@ def _resolve_service_date(raw: str) -> Optional[str]:
         return None
     raw = str(raw).strip()
 
+    def _to_dd_mm_yyyy(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        text = str(value).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            try:
+                return datetime.strptime(text, "%Y-%m-%d").strftime("%d-%m-%Y")
+            except ValueError:
+                return None
+        return text
+
     # ── relative: "today+N" produced by LLM
     m = re.match(r"today\s*\+\s*(\d+)", raw, re.I)
     if m:
@@ -159,9 +170,19 @@ def _resolve_service_date(raw: str) -> Optional[str]:
         if mon:
             return f"{day:02d}-{mon:02d}-{year}"
 
+    # ── free-form phrases like "25 ko aa jayegi" / "25th ko"
+    m = re.search(r"(?<!\d)(\d{1,2})(?:st|nd|rd|th)?(?:\s+ko)?(?!\d)", raw)
+    if m:
+        try:
+            normalized = normalize_date(m.group(1))
+            return _to_dd_mm_yyyy(normalized) or raw
+        except Exception:
+            pass
+
     # ── fallback to date_utils
     try:
-        return normalize_date(raw)
+        normalized = normalize_date(raw)
+        return _to_dd_mm_yyyy(normalized) or raw
     except Exception:
         return raw
 
@@ -216,6 +237,8 @@ def _map_option_to_days(message: str, brain_date: Optional[str]) -> Optional[str
 _DYNAMIC_BRAIN_SYSTEM = """
 You are an automated human-like conversational support agent dealing with vehicle tracking downtime.
 Your job is to analyze the conversation history and the latest message to determine intent, sub-intent, extract data, and intelligently handle scheduling rejections.
+
+CRITICAL: Always generate extremely short, one-line, or few-word informative replies. If the user asks anything out of flow, answer politely in one line and immediately nudge them back to the main topic.
 
 ## MASTER INTENT CLASSIFICATION:
 - WORKSHOP: Vehicle is at a service point, body shop, workshop, or undergoing garage maintenance.
@@ -517,7 +540,7 @@ def detect_contact_choice(text: str) -> Optional[str]:
     # If the user says "yes", "haan", "haa", "ha", or "myself", map it to "self".
     if re.search(r"\b(khud|self|main|hum|owner|mai|me|haan|haa|ha|yes|y|ok|okay|theek|thik)\b", cleaned):
         return "self"
-    if re.search(r"\b(driver|driver se|driver ko|driver ka|unse)\b", cleaned):
+    if re.search(r"\b(driver|driver se|driver ko|driver ka|unse|driver handle|driver handle karega|vehicle ke paas nahi|ghar pe nahi|paas nahi)\b", cleaned):
         return "driver"
     if re.search(r"\b(kisi aur|koi aur|other|dusra|dusre|contact person|manager|supervisor)\b", cleaned):
         return "other"
@@ -664,9 +687,9 @@ def apply_service_city_confirmation(message: str, collected: dict, ext_entities:
 
 def build_troubleshooting_prompt(current_intent: Optional[str], collected: dict, standing_hours: float) -> str:
     if current_intent == "WORKSHOP":
-        return "Workshop/Service center ka naam kya hai?"
+        return "Vehicle workshop se kab tak bahar aa jayegi?"
     if current_intent == "ACCIDENT":
-        return "Kya gaadi abhi kisi workshop ya garage me khadi hai?"
+        return "Gaadi kab tak running condition me aa jayegi?"
     if current_intent == "VEHICLE_RUNNING":
         if not collected.get("current_location"):
             return "Aapki gaadi abhi kis location par hai? (Current location batayein)"
@@ -704,6 +727,53 @@ def build_troubleshooting_prompt(current_intent: Optional[str], collected: dict,
     if not collected.get("vehicle_location"):
         return "Gaadi abhi kis city/location par chal rahi hai?"
     return "Kripya vehicle ki sthiti short me batayein."
+
+
+def transfer_owner_to_driver(
+    owner_phone: str,
+    target_phone: str,
+    collected: dict,
+    chat_hist: list,
+    current_intent: Optional[str],
+):
+    owner_ack = (
+        "Dhanyavaad Sir. Hum driver se sampark karke GPS issue ki troubleshooting continue kar rahe hain. "
+        "Agar kisi aur jaankari ki zarurat hogi to hum aapse sampark karenge."
+    )
+
+    owner_collected = dict(collected)
+    owner_collected["contact_mode"] = "driver"
+    owner_collected["active_contact_phone"] = target_phone
+    owner_collected["driver_contact_confirmed"] = True
+    owner_collected["intent"] = current_intent or owner_collected.get("intent")
+
+    chat_hist.append({"role": "bot", "text": owner_ack})
+    database.save_session(owner_phone, "TRANSFERRED_TO_DRIVER", owner_collected, chat_hist)
+    send_whatsapp_meta(owner_phone, owner_ack)
+
+    vehicle_no = owner_collected.get("vehicle_no") or "vehicle"
+    driver_prompt = (
+        f"Namaste,\n\n"
+        f"Vehicle {vehicle_no} se GPS data receive nahi ho raha hai.\n\n"
+        "Kripya vehicle ki current status batayein."
+    )
+
+    driver_collected = dict(owner_collected)
+    driver_collected["original_customer_phone"] = owner_phone
+    driver_collected["active_contact_phone"] = target_phone
+    driver_collected["contact_mode"] = "driver"
+    driver_collected["status_only"] = False
+    driver_collected["initial_alert_msg"] = driver_prompt
+
+    database.save_session(
+        target_phone,
+        "INITIAL_ALERT",
+        driver_collected,
+        [{"role": "bot", "text": driver_prompt}],
+    )
+    send_whatsapp_meta(target_phone, driver_prompt)
+
+    return {"status": "owner_handed_over_to_driver", "target_phone": target_phone}
 
 
 def reassign_troubleshooting_contact(
@@ -975,7 +1045,7 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
         return {"status": "error_processing_llm"}
 
     # Intent assignment
-    if brain.get("intent") and not collected.get("intent"):
+    if brain.get("intent"):
         collected["intent"] = brain["intent"]
     current_intent = collected.get("intent")
 
@@ -1050,6 +1120,8 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
         collected["driver_phone"] = "NOT_PROVIDED"
 
     chat_hist.append({"role": "user", "text": message})
+    session["collected_json"] = collected
+    session["chat_history"] = chat_hist
     prefix_reply = f"{brain.get('side_question_reply')}\n\n" if brain.get("side_question_reply") else ""
 
     standing_hours = collected.get("standing_hours", 0.0)
@@ -1187,12 +1259,8 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
             collected["contact_mode"] = "driver"
             collected["active_contact_phone"] = target_phone
             collected["contact_person"] = collected.get("driver_name") or collected.get("contact_person") or "Driver"
-            return reassign_troubleshooting_contact(
-                phone, target_phone, collected, chat_hist,
-                "SELF_REPAIR_IGNITION", current_intent, standing_hours,
-                "Update: customer ne driver confirmation de di hai. Hum troubleshooting driver ke saath continue kar rahe hain.",
-                explicit_prompt="Kripya ek baar ignition ON hai ya nahi check kijiye.",
-            )
+            collected["driver_contact_confirmed"] = True
+            return transfer_owner_to_driver(phone, target_phone, collected, chat_hist, current_intent)
 
         if driver_phone_in_msg:
             collected["contact_mode"] = "driver"
@@ -1203,12 +1271,8 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
             else:
                 collected["contact_person"] = collected.get("driver_name") or "Driver"
             collected["active_contact_phone"] = driver_phone_in_msg
-            return reassign_troubleshooting_contact(
-                phone, driver_phone_in_msg, collected, chat_hist,
-                "SELF_REPAIR_IGNITION", current_intent, standing_hours,
-                "Update: driver details update ho gayi hain. Hum troubleshooting naye driver ke saath continue kar rahe hain.",
-                explicit_prompt="Kripya ek baar ignition ON hai ya nahi check kijiye.",
-            )
+            collected["driver_contact_confirmed"] = True
+            return transfer_owner_to_driver(phone, driver_phone_in_msg, collected, chat_hist, current_intent)
 
         reply_msg = f"{prefix_reply}Please driver ko confirm karein ya naya naam/number bhej dein."
         chat_hist.append({"role": "bot", "text": reply_msg})
@@ -1306,46 +1370,56 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
 
     # ── WORKSHOP FLOW ─────────────────────────────────────────────────────────
     if current_intent == "WORKSHOP":
-        if not collected.get("workshop_name"):
-            reply_msg = f"{prefix_reply}Workshop/Service center ka naam kya hai?"
+        # Check if we already extracted or resolved a date in this turn
+        resolved_date = _resolve_service_date(message)
+        if resolved_date and re.match(r"\d{2}-\d{2}-\d{4}", resolved_date):
+            collected["expected_running_date"] = resolved_date
+        elif ext_entities.get("resume_date"):
+            collected["expected_running_date"] = _resolve_service_date(ext_entities["resume_date"])
+
+        if not collected.get("expected_running_date"):
+            reply_msg = f"{prefix_reply}Vehicle workshop se kab tak bahar aa jayegi?"
             chat_hist.append({"role": "bot", "text": reply_msg})
             database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
             send_whatsapp_meta(phone, reply_msg)
-            return {"status": "collecting_workshop_name"}
+            return {"status": "collecting_workshop_date"}
 
-        if not collected.get("resume_date"):
-            reply_msg = f"{prefix_reply}Vehicle kab tak ready hoke road par chalne lagegi?"
-            chat_hist.append({"role": "bot", "text": reply_msg})
-            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
-            send_whatsapp_meta(phone, reply_msg)
-            return {"status": "collecting_resume_date"}
-
-        reply_msg = "✅ Update note kar liya gaya hai. Vehicle ready hone par tracking normal ho jayegi. Dhanyavaad!"
+        # Save explicit statuses and confirmation
+        collected["status"] = "WORKSHOP"
+        expected_date = collected.get("expected_running_date") or collected.get("resume_date") or collected.get("service_date")
+        reply_msg = (
+            f"Thank you. Hum {expected_date or 'us date'} ke baad GPS status dobara check karenge."
+        )
         chat_hist.append({"role": "bot", "text": reply_msg})
         send_whatsapp_meta(phone, reply_msg)
+        
         database.save_session(phone, "CASE_CLOSED", collected, chat_hist)
         database.delete_session(phone)
         return {"status": "workshop_case_closed"}
 
     # ── ACCIDENT FLOW ─────────────────────────────────────────────────────────
     elif current_intent == "ACCIDENT":
-        if collected.get("is_in_workshop_currently") is None:
-            reply_msg = f"{prefix_reply}Kya gaadi abhi kisi workshop ya garage me khadi hai?"
-            chat_hist.append({"role": "bot", "text": reply_msg})
-            database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
-            send_whatsapp_meta(phone, reply_msg)
-            return {"status": "probing_accident_workshop"}
+        resolved_date = _resolve_service_date(message)
+        if resolved_date and re.match(r"\d{2}-\d{2}-\d{4}", resolved_date):
+            collected["expected_running_date"] = resolved_date
+        elif ext_entities.get("resume_date"):
+            collected["expected_running_date"] = _resolve_service_date(ext_entities["resume_date"])
 
-        if not collected.get("resume_date"):
+        if not collected.get("expected_running_date"):
             reply_msg = f"{prefix_reply}Gaadi kab tak running condition me aa jayegi?"
             chat_hist.append({"role": "bot", "text": reply_msg})
             database.save_session(phone, "COLLECTING_DETAILS", collected, chat_hist)
             send_whatsapp_meta(phone, reply_msg)
-            return {"status": "collecting_resume_date"}
+            return {"status": "collecting_accident_date"}
 
-        reply_msg = "✅ Details register kar li gayi hain. Emergency update backend me push ho gaya hai. Take care!"
+        collected["status"] = "ACCIDENT"
+        expected_date = collected.get("expected_running_date") or collected.get("resume_date") or collected.get("service_date")
+        reply_msg = (
+            f"Thank you. Hum {expected_date or 'us date'} tak wait karte karte hai uske baad GPS status dobara check karenge."
+        )
         chat_hist.append({"role": "bot", "text": reply_msg})
         send_whatsapp_meta(phone, reply_msg)
+        
         database.save_session(phone, "CASE_CLOSED", collected, chat_hist)
         database.delete_session(phone)
         return {"status": "accident_case_closed"}
