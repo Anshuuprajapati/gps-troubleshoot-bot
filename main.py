@@ -194,10 +194,11 @@ async def whatsapp_webhook(request: Request):
                     return {"status": "no_session", "message": "No active conversation found"}
                 
                 root_cause = session.get("collected_json", {}).get("root_cause")
+                normalized_root_cause = str(root_cause or "").upper()
                 logger.info(f"Routing to flow: {root_cause}")
                 
                 # Route to appropriate flow webhook handler
-                if root_cause == "BATTERY_ISSUE":
+                if normalized_root_cause in {"BATTERY_ISSUE", "BATTERY_LOW"}:
                     webhook_msg = WhatsAppWebhookMessage(
                         phone_number=phone_number,
                         message_text=message_text
@@ -205,7 +206,7 @@ async def whatsapp_webhook(request: Request):
                     result = await battery_webhook(webhook_msg)
                     return result
                     
-                elif root_cause == "MAIN_POWER_CUT" or root_cause == "MAIN_POWER":
+                elif normalized_root_cause in {"MAIN_POWER_CUT", "MAIN_POWER", "MAIN_POWER_CONNECTION"}:
                     webhook_msg = WhatsAppWebhookMessage(
                         phone_number=phone_number,
                         message_text=message_text
@@ -213,7 +214,7 @@ async def whatsapp_webhook(request: Request):
                     result = await main_power_webhook(webhook_msg)
                     return result
                     
-                elif root_cause == "OTHER_ISSUE":
+                elif normalized_root_cause in {"OTHER_ISSUE", "OTHER"}:
                     webhook_msg = WhatsAppWebhookMessage(
                         phone_number=phone_number,
                         message_text=message_text

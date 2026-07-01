@@ -990,6 +990,31 @@ async def start_other_issue_flow(payload: dict):
 # WEBHOOK HANDLER ENGINE
 # ==============================================================================
 
+def call_brain(state_context: str, chat_hist: list, message: str) -> dict:
+    llm_messages = []
+    for entry in chat_hist[-8:]:
+        role = "assistant" if entry.get("role") == "bot" else "user"
+        content = entry.get("text") or entry.get("content") or ""
+        llm_messages.append({"role": role, "content": content})
+    llm_messages.append({"role": "user", "content": message})
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": _DYNAMIC_BRAIN_SYSTEM},
+                *llm_messages,
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            max_tokens=500,
+        )
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        logger.error(f"[LLM Brain Exception] {e}")
+        raise
+
+
 async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
     phone = msg.phone_number
     message = msg.message_text.strip()
@@ -1021,27 +1046,9 @@ async def handle_whatsapp_replies(msg: WhatsAppWebhookMessage) -> dict:
         return {"status": "status_only_update"}
 
     # ── LLM Brain ─────────────────────────────────────────────────────────────
-    llm_messages = []
-    for entry in chat_hist[-8:]:
-        role = "assistant" if entry.get("role") == "bot" else "user"
-        content = entry.get("text") or entry.get("content") or ""
-        llm_messages.append({"role": role, "content": content})
-    llm_messages.append({"role": "user", "content": message})
-
     try:
-        response = openai_client.chat.completions.create(
-            model=AZURE_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": _DYNAMIC_BRAIN_SYSTEM},
-                *llm_messages
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            max_tokens=500,
-        )
-        brain = json.loads(response.choices[0].message.content.strip())
-    except Exception as e:
-        logger.error(f"[LLM Brain Exception] {e}")
+        brain = call_brain("general", chat_hist, message)
+    except Exception:
         return {"status": "error_processing_llm"}
 
     # Intent assignment
